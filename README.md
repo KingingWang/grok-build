@@ -18,6 +18,7 @@ Protocol (ACP).
 
 [Installing the released binary](#installing-the-released-binary) ·
 [Building from source](#building-from-source) ·
+[Fork customizations](#fork-customizations) ·
 [Documentation](#documentation) ·
 [Repository layout](#repository-layout) ·
 [Development](#development) ·
@@ -81,6 +82,114 @@ cargo check -p xai-grok-pager-bin            # fast validation
 The binary artifact is named `xai-grok-pager`; official installs ship it as
 `grok`. On first launch it opens your browser to authenticate — see the
 [authentication guide](crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md).
+
+## Fork customizations
+
+> [!IMPORTANT]
+> This fork intentionally diverges from `xai-org/grok-build`. Preserve the
+> behavior and configuration contracts in this section when rebasing onto a
+> newer upstream version. The initial implementation was based on upstream
+> commit `6e38642`.
+
+### Configuration additions
+
+The following fields can be set globally under `[models]` and overridden for
+one model under `[model."<id>"]`:
+
+```toml
+[models]
+stream = true
+user_agent = "my-client/1.0"
+responses_system_prompt_as_instructions = false
+
+[model."third-party-responses"]
+# Existing provider/model fields go here.
+stream = true
+user_agent = "my-client/1.0"
+responses_system_prompt_as_instructions = true
+```
+
+- `stream` defaults to `true`. Set it to `false` to use a non-streaming HTTP
+  request. Chat Completions, Responses, and Anthropic Messages all use the
+  same completion, empty-response, truncation, and retry pipeline in either
+  mode.
+- `user_agent` sets the HTTP `User-Agent`. A per-model value overrides the
+  global value and takes precedence over a `User-Agent` entry in
+  `extra_headers`.
+- `responses_system_prompt_as_instructions` defaults to `false`. When enabled,
+  system messages are removed from Responses `input` and joined, in order,
+  into the top-level `instructions` field. This supports OpenAI-compatible
+  providers that reject system-role input items.
+
+### Retry and authentication policy
+
+- Every HTTP status code, including 4xx, 429, and 5xx, is retryable with
+  exponential backoff. `Retry-After` is still honored when present, and
+  `x-should-retry: false` does not bypass this fork's retry policy.
+- The retry loop has a 600-second wall-clock budget and retains `max_retries`
+  as a count-based safety net; whichever limit is reached first stops the
+  request. Non-HTTP errors that cannot be repaired by resampling, such as
+  invalid configuration, serialization failures, and max-token truncation,
+  retain their dedicated terminal behavior.
+- On HTTP 401, refresh-capable sessions (OAuth/session bearer resolver,
+  configured auth provider, or devbox) hand the first failure to the session
+  for credential refresh and resubmission. Static API-key/BYOK endpoints have
+  no refresh mechanism, so their 401 responses use the normal exponential
+  backoff path instead.
+
+### Responses streaming compatibility
+
+- A non-standard `response.metadata` SSE event is ignored only when the JSON
+  payload's top-level `type` exactly matches that name. Other unknown events
+  remain serialization errors so future content events are not hidden.
+- If `response.completed.response.output` contains no assistant text but the
+  stream already delivered non-empty `response.output_text.delta` events, the
+  final assistant text is reconstructed from those deltas. A non-empty
+  terminal response remains authoritative, and `response.incomplete` is not
+  converted into a successful completion.
+
+### Upstream rebase checklist
+
+Add the official repository as `upstream` once, then rebase the fork branch:
+
+```sh
+git remote add upstream git@github.com:xai-org/grok-build.git # once
+git fetch upstream
+git switch main
+git rebase upstream/main
+```
+
+The most likely conflict areas are:
+
+- model/config propagation in `xai-grok-shell`, `xai-chat-state`, and
+  `xai-grok-sampler::SamplerConfig`;
+- request dispatch and terminal response construction in
+  `xai-grok-sampler/src/actor/request_task.rs`;
+- HTTP headers and Responses SSE decoding in
+  `xai-grok-sampler/src/client.rs`;
+- retry classification/time budgeting in `xai-grok-sampler/src/retry.rs`,
+  `xai-grok-sampler/src/actor/request_task.rs`, and
+  `xai-grok-sampling-types/src/error.rs`;
+- 401 refresh eligibility in
+  `xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs`.
+
+After resolving conflicts, verify all fork contracts before updating the
+published branch:
+
+```sh
+cargo fmt --all -- --check
+cargo test -p xai-grok-sampler
+cargo clippy -p xai-grok-sampler --all-targets -- -D warnings
+cargo clippy -p xai-grok-pager-bin --all-targets -- -D warnings
+cargo build -p xai-grok-pager-bin --release
+```
+
+Because a rebase rewrites published history, update the fork only with lease
+protection after reviewing the result:
+
+```sh
+git push --force-with-lease origin main
+```
 
 ## Documentation
 
