@@ -25,7 +25,7 @@ use xai_grok_sampler::{
     SamplingErrorKind, SamplingEvent,
 };
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, UserItem,
+    ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, StopReason, UserItem,
 };
 use xai_grok_test_support::{SseEvent, sse};
 
@@ -86,6 +86,8 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         // Keep retries minimal so tests don't take forever.
         max_retries: Some(2),
         stream_tool_calls: false,
+        stream: true,
+        responses_system_prompt_as_instructions: false,
         idle_timeout_secs: Some(30),
         reasoning_effort: None,
         origin_client: None,
@@ -95,6 +97,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         client_version: None,
         attribution_callback: None,
         bearer_resolver: None,
+        auth_refresh_available: false,
         supports_backend_search: false,
         compactions_remaining: None,
         compaction_at_tokens: None,
@@ -258,6 +261,259 @@ async fn submit_and_collect_returns_response() {
     let (response, _metrics) = result;
     let a = response.assistant().expect("assistant item present");
     assert_eq!(a.content.as_ref(), "collected response");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_empty_terminal_output_uses_streamed_text_without_retry() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let events = vec![
+                    Event::default().data(
+                        json!({
+                            "type": "response.metadata",
+                            "sequence_number": 0,
+                            "metadata": {"provider": "third-party"}
+                        })
+                        .to_string(),
+                    ),
+                    Event::default().data(
+                        json!({
+                            "type": "response.output_text.delta",
+                            "sequence_number": 1,
+                            "item_id": "item-1",
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": "hello from delta"
+                        })
+                        .to_string(),
+                    ),
+                    Event::default().data(
+                        json!({
+                            "type": "response.completed",
+                            "sequence_number": 2,
+                            "response": {
+                                "id": "resp-1",
+                                "object": "response",
+                                "created_at": 0,
+                                "model": "test-model",
+                                "status": "completed",
+                                "output": []
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    Event::default().data("[DONE]"),
+                ];
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        responses_config(server.base_url(), None),
+        RetryPolicy::default(),
+        event_tx,
+    );
+
+    let result = handle
+        .submit_and_collect(
+            RequestId::from("req-responses-fallback"),
+            user_request("hi"),
+        )
+        .await;
+    server.shutdown();
+
+    let (response, _metrics) = result.expect("streamed text should complete successfully");
+    assert_eq!(response.assistant_text(), "hello from delta");
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "must not retry");
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming mode (stream = false)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_and_collect_non_stream_returns_response() {
+    // Server returns a single non-streaming Chat Completions JSON body (no SSE).
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let body = json!({
+                "id": "chatcmpl-nonstream",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "non-streamed reply"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 3,
+                    "total_tokens": 8
+                }
+            });
+            axum::Json(body)
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let mut cfg = test_config(server.base_url(), "test-model");
+    cfg.stream = false;
+    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+
+    let rid = RequestId::from("req-nonstream");
+    let result = handle
+        .submit_and_collect(rid, user_request("hi"))
+        .await
+        .expect("non-stream collected ok");
+    server.shutdown();
+
+    let (response, _metrics) = result;
+    let a = response.assistant().expect("assistant item present");
+    assert_eq!(a.content.as_ref(), "non-streamed reply");
+    assert_eq!(response.stop_reason, Some(StopReason::Stop));
+    let usage = response.usage.expect("usage present");
+    assert_eq!(usage.completion_tokens, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn byok_401_retries_with_backoff_until_time_budget() {
+    // Static BYOK (no refresh mechanism): `auth_refresh_available = false`.
+    // A 401 must retry in-loop with backoff (up to the time budget) instead
+    // of being emitted to the session for a refresh that can't happen.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let attempts = std::sync::Arc::new(AtomicU32::new(0));
+    let attempts_clone = std::sync::Arc::clone(&attempts);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let attempts = std::sync::Arc::clone(&attempts_clone);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::UNAUTHORIZED, "nope")
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let mut cfg = test_config(server.base_url(), "test-model");
+    cfg.stream = false;
+    cfg.auth_refresh_available = false; // static BYOK — no refresh
+    let retry_policy = RetryPolicy {
+        max_retries: 30,
+        rate_limit_retry_threshold: 2,
+        retry_only_before_output: false,
+        max_retry_duration_secs: 1, // keep the test fast
+    };
+    let handle = SamplerActor::spawn(cfg, retry_policy, event_tx);
+
+    let rid = RequestId::from("req-byok-401");
+    let result = handle.submit_and_collect(rid, user_request("hi")).await;
+    server.shutdown();
+    assert!(
+        result.is_err(),
+        "BYOK 401 should retry then fail, not refresh"
+    );
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "expected in-loop retries (>=2 attempts), got {}",
+        attempts.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_capable_401_emits_to_session_on_first_attempt() {
+    // Refresh-capable model (auth_refresh_available = true): the FIRST 401 is
+    // emitted to the session (returns Err so the session can refresh+resubmit),
+    // NOT retried in-loop. The mock server should see exactly one attempt.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let attempts = std::sync::Arc::new(AtomicU32::new(0));
+    let attempts_clone = std::sync::Arc::clone(&attempts);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let attempts = std::sync::Arc::clone(&attempts_clone);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::UNAUTHORIZED, "nope")
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let mut cfg = test_config(server.base_url(), "test-model");
+    cfg.stream = false;
+    cfg.auth_refresh_available = true; // refresh-capable (OAuth/provider)
+    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+
+    let rid = RequestId::from("req-refresh-401");
+    let result = handle.submit_and_collect(rid, user_request("hi")).await;
+    server.shutdown();
+    assert!(
+        result.is_err(),
+        "first 401 should be emitted to session (Err), not retried in-loop"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "refresh-capable 401 should fire exactly one attempt (emit, not retry)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_stream_retries_5xx_until_time_budget_then_fails() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let attempts = std::sync::Arc::new(AtomicU32::new(0));
+    let attempts_clone = std::sync::Arc::clone(&attempts);
+    // Server always returns 500 — under the new policy every HTTP error code
+    // retries. With a tiny time budget the loop gives up and surfaces Fatal.
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let attempts = std::sync::Arc::clone(&attempts_clone);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let mut cfg = test_config(server.base_url(), "test-model");
+    cfg.stream = false;
+    let retry_policy = RetryPolicy {
+        max_retries: 30,
+        rate_limit_retry_threshold: 2,
+        retry_only_before_output: false,
+        // 1-second budget so the test stays fast while still exercising the
+        // retry loop at least once.
+        max_retry_duration_secs: 1,
+    };
+    let handle = SamplerActor::spawn(cfg, retry_policy, event_tx);
+
+    let rid = RequestId::from("req-500-retry");
+    let result = handle.submit_and_collect(rid, user_request("hi")).await;
+    server.shutdown();
+    assert!(result.is_err(), "expected the 500 loop to fail");
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "expected at least 2 attempts (1 initial + 1 retry), got {}",
+        attempts.load(Ordering::SeqCst)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -518,7 +774,10 @@ async fn auth_401_emits_failed_immediately_no_retry() {
     );
     let server = MockServer::spawn(app).await;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let cfg = test_config(server.base_url(), "test-model");
+    let mut cfg = test_config(server.base_url(), "test-model");
+    // Refresh-capable model (OAuth/provider/devbox): the first 401 is
+    // emitted to the session for a one-shot refresh, NOT retried in-loop.
+    cfg.auth_refresh_available = true;
     let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
 
     let rid = RequestId::from("req-auth");
@@ -527,9 +786,9 @@ async fn auth_401_emits_failed_immediately_no_retry() {
     let events = drain_until_terminal(&mut event_rx, Duration::from_secs(5)).await;
     server.shutdown();
 
-    // Auth errors are session-owned -- `classify_error` returns
-    // `EmitToSession` so the actor emits Failed immediately without
-    // retrying.
+    // Refresh-capable 401: emitted to the session immediately (Failed),
+    // no in-loop retry. (Static-BYOK 401 retries in-loop — covered by
+    // `byok_401_retries_with_backoff_until_time_budget`.)
     assert!(
         !events
             .iter()
@@ -541,7 +800,11 @@ async fn auth_401_emits_failed_immediately_no_retry() {
         }
         other => panic!("expected Failed(Auth), got {other:?}"),
     }
-    assert_eq!(counter.load(Ordering::SeqCst), 1, "no retries on 401");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "no in-loop retries on refresh-capable 401"
+    );
 }
 
 // ---------------------------------------------------------------------------

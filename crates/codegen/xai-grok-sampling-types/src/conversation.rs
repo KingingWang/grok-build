@@ -583,6 +583,10 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// When true, Responses API system messages are sent through the top-level
+    /// `instructions` field instead of `input` items with `role: "system"`.
+    /// This is required by some OpenAI-compatible third-party endpoints.
+    pub responses_system_prompt_as_instructions: bool,
 }
 
 impl ConversationRequest {
@@ -2194,6 +2198,7 @@ impl From<ConversationRequest> for ChatCompletionRequest {
 impl From<&ConversationRequest> for rs::CreateResponse {
     fn from(req: &ConversationRequest) -> Self {
         let input = build_responses_input(req);
+        let instructions = build_responses_instructions(req);
         let tools = build_responses_tools(req);
 
         let tool_choice = req.tool_choice.as_ref().map(|tc| match tc {
@@ -2227,7 +2232,7 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             conversation: None,
             include: None,
             input,
-            instructions: None,
+            instructions,
             max_output_tokens: req.max_output_tokens,
             max_tool_calls: None,
             metadata: None,
@@ -2268,9 +2273,38 @@ fn build_responses_input(req: &ConversationRequest) -> rs::InputParam {
     let items: Vec<rs::InputItem> = req
         .items
         .iter()
+        .filter(|item| {
+            !(req.responses_system_prompt_as_instructions
+                && matches!(item, ConversationItem::System(_)))
+        })
         .flat_map(conversation_item_to_input_items)
         .collect();
     rs::InputParam::Items(items)
+}
+
+/// Collect system messages for Responses API endpoints that require the
+/// top-level `instructions` field. Multiple system messages retain their
+/// relative order and are separated by a blank line.
+fn build_responses_instructions(req: &ConversationRequest) -> Option<String> {
+    if !req.responses_system_prompt_as_instructions {
+        return None;
+    }
+
+    let mut instructions = String::new();
+    for item in &req.items {
+        let ConversationItem::System(system) = item else {
+            continue;
+        };
+        if system.content.is_empty() {
+            continue;
+        }
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(&system.content);
+    }
+
+    (!instructions.is_empty()).then_some(instructions)
 }
 
 /// Walk a serialized Responses API request body and inject the
@@ -3667,6 +3701,48 @@ mod tests {
             panic!("Expected Items input");
         };
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn responses_system_prompt_can_use_top_level_instructions() {
+        let mut req = ConversationRequest::from_items(vec![
+            ConversationItem::system("System prompt"),
+            ConversationItem::user("User message"),
+        ]);
+        req.responses_system_prompt_as_instructions = true;
+
+        let responses_req: rs::CreateResponse = (&req).into();
+        assert_eq!(responses_req.instructions.as_deref(), Some("System prompt"));
+
+        let rs::InputParam::Items(items) = responses_req.input else {
+            panic!("Expected Items input");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            rs::InputItem::EasyMessage(message) if message.role == rs::Role::User
+        ));
+    }
+
+    #[test]
+    fn responses_instructions_preserve_multiple_system_message_order() {
+        let mut req = ConversationRequest::from_items(vec![
+            ConversationItem::system("first"),
+            ConversationItem::system(""),
+            ConversationItem::system("second"),
+            ConversationItem::user("hello"),
+        ]);
+        req.responses_system_prompt_as_instructions = true;
+
+        let responses_req: rs::CreateResponse = (&req).into();
+        assert_eq!(
+            responses_req.instructions.as_deref(),
+            Some("first\n\nsecond")
+        );
+        let rs::InputParam::Items(items) = responses_req.input else {
+            panic!("Expected Items input");
+        };
+        assert_eq!(items.len(), 1);
     }
 
     #[test]
