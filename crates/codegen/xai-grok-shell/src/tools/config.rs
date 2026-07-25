@@ -202,6 +202,7 @@ pub(crate) fn web_search_sampling_config(base: SamplerConfig) -> SamplerConfig {
         temperature: Some(0.1),
         top_p: Some(0.95),
         force_http1: false,
+        stream: true,
         max_retries: None,
         ..base
     }
@@ -228,6 +229,8 @@ impl ShellToolsetConfig {
             force_http1: false,
             max_retries: None,
             stream_tool_calls: false,
+            stream: true,
+            responses_system_prompt_as_instructions: false,
             idle_timeout_secs: None,
             client_identifier: None,
             deployment_id: None,
@@ -243,6 +246,7 @@ impl ShellToolsetConfig {
             // agent/config.rs and acp_session.rs.
             attribution_callback: None,
             bearer_resolver: None,
+            auth_refresh_available: false,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,
