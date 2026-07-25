@@ -540,6 +540,10 @@ pub(crate) async fn spawn_session_actor(
         context_window: context_window_override.unwrap_or(baseline_context_window),
         reasoning_effort: sampling_config.reasoning_effort,
         stream_tool_calls: Some(sampling_config.stream_tool_calls),
+        stream: Some(sampling_config.stream),
+        responses_system_prompt_as_instructions: Some(
+            sampling_config.responses_system_prompt_as_instructions,
+        ),
     };
     let actor_pruning_config = xai_chat_state::PruningConfig {
         enabled: session_pruning_config.enabled,
@@ -1232,6 +1236,7 @@ pub(crate) async fn spawn_session_actor(
         max_retries: max_retries.unwrap_or(5),
         rate_limit_retry_threshold: 2,
         retry_only_before_output,
+        max_retry_duration_secs: xai_grok_sampler::config::DEFAULT_MAX_RETRY_DURATION_SECS,
     };
     let (sampler_event_tx, sampler_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<xai_grok_sampler::SamplingEvent>();
