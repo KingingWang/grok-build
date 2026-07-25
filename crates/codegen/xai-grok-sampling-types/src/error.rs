@@ -7,9 +7,8 @@ use std::fmt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use xai_circuit_breaker::RetryPolicy;
 
-use crate::provider_error::{parse_provider_error, parse_provider_error_str};
+use xai_circuit_breaker::RetryPolicy;
 
 pub type Result<T> = std::result::Result<T, SamplingError>;
 
@@ -315,14 +314,30 @@ impl SamplingError {
 
     pub fn is_retryable(&self) -> bool {
         match self {
-            SamplingError::Auth { .. } => false,
+            // `Auth` covers both a client-side bearer construction failure
+            // and a server 401 (the HTTP client lifts a 401 response into
+            // `Auth(...)`). It is retryable: refresh-capable models have
+            // the first 401 intercepted in `apply_retry_decision` (emitted
+            // to the session for a one-shot refresh); static-BYOK models
+            // retry in-loop with backoff. A misconfigured model with no key
+            // at all will retry uselessly up to the time budget — accepted
+            // edge case.
+            SamplingError::Auth { .. } => true,
             SamplingError::InvalidConfiguration(_) => false,
             SamplingError::Http(err) => is_retryable_reqwest(err),
             SamplingError::Serialization(_) => false,
-            SamplingError::Api { status, .. } => is_retryable_api_status(*status),
+            // All HTTP status codes are retryable. The caller's retry loop
+            // enforces a total time budget (default 10 min), so even
+            // deterministic-looking 4xx (400/403/404/408/422) are retried
+            // up to that cap rather than failing the turn immediately.
+            // 401 is intercepted earlier (auth-refresh path) before this
+            // method is consulted.
+            SamplingError::Api { .. } => true,
             SamplingError::EventStreamError(_) => true,
             SamplingError::StreamError { .. } => true,
-            SamplingError::IdleTimeout { .. } => false,
+            // Model stuck: a fresh sample is the remedy, so retry within
+            // the time budget instead of failing immediately.
+            SamplingError::IdleTimeout { .. } => true,
             SamplingError::EmptyResponse { .. } => true,
             SamplingError::MaxTokensTruncation => false,
             SamplingError::DoomLoopDetected { .. } => true,
@@ -466,24 +481,16 @@ pub fn status_user_message(status: StatusCode) -> String {
         code @ 502..=504 => {
             format!("Grok is temporarily unavailable. Please try again in a moment. (HTTP {code}).")
         }
-        // Upstream capacity, not an edge failure — see [`SamplingError::is_overloaded`].
-        code @ 529 => {
-            format!("Grok is temporarily overloaded. Please try again in a moment. (HTTP {code}).")
-        }
-        // Cloudflare edge: origin unreachable or timed out (520–524), or an
-        // edge-side 1xxx failure (530).
-        code @ 520..=524 | code @ 530 => {
+        // Cloudflare edge codes (origin down / connect fail / timeout / …).
+        code @ 520..=524 => {
             format!(
                 "Connection to Grok timed out or was interrupted. Please try again. (HTTP {code})."
             )
         }
-        // Cloudflare origin TLS (handshake / invalid certificate) — not transient.
-        code @ 525 | code @ 526 => {
-            format!("Secure connection to Grok failed. (HTTP {code}).")
-        }
         code if status.is_server_error() => {
             format!("Something went wrong on the server (HTTP {code}).")
         }
+        code if status.is_client_error() => format!("Request failed (HTTP {code})."),
         code => format!("Request failed (HTTP {code})."),
     }
 }
@@ -501,29 +508,13 @@ fn truncate_user_error(s: &str) -> String {
 
 /// Format a known JSON error envelope; `None` if the body is not structured.
 fn structured_error_message(bytes: &[u8]) -> Option<String> {
-    let rigid = std::str::from_utf8(bytes).ok().and_then(try_parse_error);
-    if let Some((error_type, message)) = &rigid
-        && message != "unknown error"
-    {
-        if let Some(inner) = parse_provider_error_str(message)
-            && inner.message != *message
-            && !inner.message_is_markup()
-        {
-            return Some(inner.display_message());
-        }
-        let msg = if error_type == "unknown" || error_type == "server_error" {
-            message.clone()
-        } else {
-            format!("{error_type}: {message}")
-        };
-        return Some(truncate_user_error(&msg));
-    }
-    if let Some(parsed) = parse_provider_error(bytes)
-        && !parsed.message_is_markup()
-    {
-        return Some(parsed.display_message());
-    }
-    rigid.map(|(_, message)| truncate_user_error(&message))
+    let (error_type, message) = std::str::from_utf8(bytes).ok().and_then(try_parse_error)?;
+    let msg = if error_type == "unknown" || error_type == "server_error" {
+        message
+    } else {
+        format!("{error_type}: {message}")
+    };
+    Some(truncate_user_error(&msg))
 }
 
 /// Parse an API error body into a short string.
@@ -582,7 +573,10 @@ pub fn is_retryable_reqwest(err: &reqwest::Error) -> bool {
     }
 
     if err.is_status() {
-        return err.status().is_some_and(is_retryable_api_status);
+        return matches!(
+            err.status(),
+            Some(status) if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     if err.is_request() || err.is_body() {
@@ -825,12 +819,11 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_is_not_retryable() {
+    fn idle_timeout_is_retryable() {
+        // IdleTimeout is now retried within the time budget — a fresh sample
+        // may complete where the previous one stalled.
         let err = SamplingError::IdleTimeout { elapsed_secs: 300 };
-        assert!(
-            !err.is_retryable(),
-            "IdleTimeout must not be retried — would cause 3× amplification"
-        );
+        assert!(err.is_retryable(), "IdleTimeout should be retryable");
     }
 
     #[test]
@@ -924,71 +917,6 @@ mod tests {
         let bytes = br#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#;
         let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
         assert_eq!(msg, "rate_limit_error: rate limit exceeded");
-    }
-
-    #[test]
-    fn user_facing_surfaces_dialects_the_rigid_parse_rejects() {
-        let bytes = br#"{"error":{"message":"Provider returned error","code":429}}"#;
-        let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
-        assert_eq!(msg, "Provider returned error");
-
-        let bytes = br#"{"message":"The model is not ready for inference"}"#;
-        let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
-        assert_eq!(msg, "The model is not ready for inference");
-
-        let bytes =
-            br#"[{"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}]"#;
-        let msg = user_facing_api_error_message(StatusCode::TOO_MANY_REQUESTS, bytes);
-        assert_eq!(msg, "Quota exceeded");
-
-        let bytes = br#""A request may either be streaming or deferred, but not both.""#;
-        let msg = user_facing_api_error_message(StatusCode::BAD_REQUEST, bytes);
-        assert_eq!(
-            msg,
-            "A request may either be streaming or deferred, but not both."
-        );
-    }
-
-    #[test]
-    fn user_facing_unwraps_double_encoded_relay_bodies() {
-        let bytes = br#"{"error":"{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Values detected in request that violate rules: JWT Token\"}}"}"#;
-        let msg = user_facing_api_error_message(StatusCode::BAD_REQUEST, bytes);
-        assert_eq!(
-            msg,
-            "invalid_request_error: Values detected in request that violate rules: JWT Token"
-        );
-    }
-
-    #[test]
-    fn user_facing_never_surfaces_double_encoded_html() {
-        let bytes = br#"{"error":"<html><body>502 Bad Gateway</body></html>"}"#;
-        let msg = user_facing_api_error_message(StatusCode::BAD_GATEWAY, bytes);
-        assert_eq!(msg, "<html><body>502 Bad Gateway</body></html>");
-    }
-
-    #[test]
-    fn user_facing_rigid_shapes_are_unchanged_by_the_fallback() {
-        for (body, expected) in [
-            (
-                r#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#,
-                "rate_limit_error: rate limit exceeded",
-            ),
-            (
-                r#"{"code":"The service is currently unavailable","error":"Service temporarily unavailable."}"#,
-                "The service is currently unavailable: Service temporarily unavailable.",
-            ),
-            (
-                r#"{"error":{"message":"Overloaded","type":"overloaded_error"}}"#,
-                "overloaded_error: Overloaded",
-            ),
-            (r#"{"error":{"message":"boom","type":"unknown"}}"#, "boom"),
-        ] {
-            assert_eq!(
-                user_facing_api_error_message(StatusCode::INTERNAL_SERVER_ERROR, body.as_bytes()),
-                expected,
-                "body: {body}"
-            );
-        }
     }
 
     #[test]
@@ -1141,9 +1069,14 @@ mod tests {
             should_retry: None,
         };
         assert!(err.is_encrypted_content_error());
+        // Under the time-budget retry policy, every HTTP error code reports
+        // `is_retryable() == true`. Encrypted-content errors are still
+        // intercepted earlier in `classify_error` (emitted to the session
+        // rather than retried in-loop), so `is_retryable()` no longer gates
+        // that decision.
         assert!(
-            !err.is_retryable(),
-            "encrypted_content errors must not be retried"
+            err.is_retryable(),
+            "all HTTP error codes report retryable under the time-budget policy"
         );
     }
 
@@ -1242,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn image_processing_error_400_is_not_retryable_standalone() {
+    fn image_processing_error_400_reports_retryable() {
         let err = SamplingError::Api {
             status: StatusCode::BAD_REQUEST,
             message: "Could not process image".into(),
@@ -1250,38 +1183,10 @@ mod tests {
             retry_after_secs: None,
             should_retry: None,
         };
-        assert!(
-            !err.is_retryable(),
-            "direct 400 must not be retryable by is_retryable()"
-        );
-    }
-
-    fn api_status_err(code: u16) -> SamplingError {
-        SamplingError::Api {
-            status: StatusCode::from_u16(code).unwrap(),
-            message: status_user_message(StatusCode::from_u16(code).unwrap()),
-            model_metadata: None,
-            retry_after_secs: None,
-            should_retry: None,
-        }
-    }
-
-    #[test]
-    fn transient_5xx_is_retryable_but_origin_tls_is_not() {
-        // Cloudflare edge pages (520-524, 530), upstream overload (529), and
-        // non-CF 5xx like 501/507 — the rule is any 5xx, not a code list.
-        for code in [501u16, 507, 520, 521, 522, 523, 524, 529, 530] {
-            assert!(
-                api_status_err(code).is_retryable(),
-                "{code} must be retried"
-            );
-        }
-        // Origin TLS: a broken certificate never clears on its own.
-        for code in [525u16, 526] {
-            assert!(
-                !api_status_err(code).is_retryable(),
-                "origin-TLS {code} must not be retried"
-            );
-        }
+        assert!(err.is_image_processing_error());
+        // `is_retryable()` is true for every HTTP error code under the
+        // time-budget policy; image-strip recovery is decided in
+        // `classify_error`, not here.
+        assert!(err.is_retryable());
     }
 }
