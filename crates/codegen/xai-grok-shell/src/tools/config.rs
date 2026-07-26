@@ -232,6 +232,7 @@ impl ShellToolsetConfig {
             stream: true,
             responses_system_prompt_as_instructions: false,
             idle_timeout_secs: None,
+            request_timeout_secs: None,
             client_identifier: None,
             deployment_id: None,
             user_id: None,
