@@ -20,6 +20,7 @@ use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 use serde::Serialize;
+use std::time::Duration;
 
 use xai_grok_sampling_types::error::{try_parse_stream_error, user_facing_api_error_message};
 use xai_grok_sampling_types::{
@@ -29,7 +30,7 @@ use xai_grok_sampling_types::{
     rs,
 };
 
-use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
+use crate::config::{DEFAULT_REQUEST_TIMEOUT_SECS, AuthScheme, OriginClientInfo, SamplerConfig};
 
 // Re-export ApiBackend from the shared types crate for downstream callers.
 pub use xai_grok_sampling_types::ApiBackend;
@@ -338,6 +339,10 @@ pub struct SamplingClient {
     header_injector: Option<crate::config::SharedHeaderInjector>,
     /// Endpoint URL builder, resolved once from `base_url` + `query_params`.
     endpoint: EndpointTemplate,
+    /// Overall request timeout for non-streaming (send + body) and
+    /// response-header wait for streaming. Resolved from
+    /// `config.request_timeout_secs` at construction.
+    request_timeout: Duration,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -350,6 +355,7 @@ impl std::fmt::Debug for SamplingClient {
                 &self.attribution_callback.is_some(),
             )
             .field("has_bearer_resolver", &self.bearer_resolver.is_some())
+            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -658,6 +664,11 @@ impl SamplingClient {
         };
 
         let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
+        let request_timeout = Duration::from_secs(
+            config
+                .request_timeout_secs
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+        );
 
         Ok(Self {
             http,
@@ -668,6 +679,7 @@ impl SamplingClient {
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
             endpoint,
+            request_timeout,
         })
     }
 
@@ -726,6 +738,47 @@ impl SamplingClient {
             injector.inject(&mut headers);
         }
         self.http.post(url).headers(headers)
+    }
+
+    /// Like [`Self::post`] but with an overall request timeout applied via
+    /// `RequestBuilder::timeout`. Use for non-streaming requests where the
+    /// entire response (headers + body) must arrive within
+    /// [`Self::request_timeout`]; streaming requests should use
+    /// [`Self::post`] plus [`Self::execute_streaming`] instead — the L2
+    /// per-chunk idle timeout covers inter-chunk gaps once the stream starts.
+    fn post_timed(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        self.post(url).timeout(self.request_timeout)
+    }
+
+    /// Execute a pre-built streaming request, wrapping `http.execute` in
+    /// a timeout that covers the response-header wait. Once headers arrive,
+    /// the L2 per-chunk idle timeout covers inter-chunk gaps. A timeout here
+    /// produces `IdleTimeout` (retryable with exponential backoff).
+    async fn execute_streaming(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<reqwest::Response> {
+        let timeout = self.request_timeout;
+        match tokio::time::timeout(timeout, self.http.execute(request)).await {
+            Ok(result) => result.map_err(|e| {
+                tracing::debug!("HTTP request failed: {}", e);
+                record_stream_request_failure(&e);
+                SamplingError::from(e)
+            }),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: crate::sampling_log::TARGET,
+                    elapsed_secs = timeout.as_secs(),
+                    "streaming request timed out waiting for response headers",
+                );
+                let span = tracing::Span::current();
+                span.record("success", false);
+                span.record("error", "request timeout (no response headers)");
+                Err(SamplingError::IdleTimeout {
+                    elapsed_secs: timeout.as_secs(),
+                })
+            }
+        }
     }
 
     /// Bearer prefix for 401 attribution. When a resolver is wired it is
@@ -928,7 +981,7 @@ impl SamplingClient {
             user_id: payload.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
+            .apply(self.post_timed(self.endpoint("chat/completions")))
             .json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1002,11 +1055,7 @@ impl SamplingClient {
         );
         Self::log_request_headers(&built_request, "chat/completions");
 
-        let response = self.http.execute(built_request).await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            record_stream_request_failure(&e);
-            e
-        })?;
+        let response = self.execute_streaming(built_request).await?;
 
         let status = response.status();
         let span = tracing::Span::current();
@@ -1199,7 +1248,7 @@ impl SamplingClient {
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
+            .apply(self.post_timed(self.endpoint("responses")))
             .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1361,11 +1410,7 @@ impl SamplingClient {
         );
         Self::log_request_headers(&built_request, "responses");
 
-        let response = self.http.execute(built_request).await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            record_stream_request_failure(&e);
-            e
-        })?;
+        let response = self.execute_streaming(built_request).await?;
 
         let status = response.status();
         let span = tracing::Span::current();
@@ -1542,7 +1587,7 @@ impl SamplingClient {
             user_id: request.x_grok_user_id.as_deref(),
         };
         let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
+            .apply(self.post_timed(self.endpoint("messages")))
             .json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1665,11 +1710,7 @@ impl SamplingClient {
         );
         Self::log_request_headers(&built_request, "messages");
 
-        let response = self.http.execute(built_request).await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            record_stream_request_failure(&e);
-            e
-        })?;
+        let response = self.execute_streaming(built_request).await?;
 
         let status = response.status();
         let span = tracing::Span::current();
@@ -2058,6 +2099,7 @@ mod tests {
             stream: true,
             responses_system_prompt_as_instructions: false,
             idle_timeout_secs: None,
+            request_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,
             client_identifier: None,
