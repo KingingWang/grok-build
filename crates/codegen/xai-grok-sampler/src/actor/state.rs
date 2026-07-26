@@ -99,6 +99,7 @@ mod tests {
             stream: true,
             responses_system_prompt_as_instructions: false,
             idle_timeout_secs: None,
+            request_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,
             client_identifier: None,
