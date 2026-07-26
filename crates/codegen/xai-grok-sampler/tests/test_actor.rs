@@ -25,7 +25,8 @@ use xai_grok_sampler::{
     SamplingErrorKind, SamplingEvent,
 };
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, StopReason, UserItem,
+    ConversationItem, ConversationRequest, DoomLoopRecoveryPolicy, SamplingError,
+    StopReason, UserItem,
 };
 use xai_grok_test_support::{SseEvent, sse};
 
@@ -89,6 +90,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         stream: true,
         responses_system_prompt_as_instructions: false,
         idle_timeout_secs: Some(30),
+        request_timeout_secs: None,
         reasoning_effort: None,
         origin_client: None,
         client_identifier: None,
@@ -513,6 +515,111 @@ async fn non_stream_retries_5xx_until_time_budget_then_fails() {
         attempts.load(Ordering::SeqCst) >= 2,
         "expected at least 2 attempts (1 initial + 1 retry), got {}",
         attempts.load(Ordering::SeqCst)
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// Request timeout (no response from server)
+// ---------------------------------------------------------------------------
+
+/// A non-streaming request to a server that never responds must time out
+/// (via `RequestBuilder::timeout` in `post_timed`) and surface as a
+/// retryable error — not hang forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_stream_hang_times_out_and_fails() {
+    // Handler that accepts the request but never sends response headers.
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async { std::future::pending::<()>().await }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let mut cfg = test_config(server.base_url(), "test-model");
+    cfg.stream = false;
+    cfg.request_timeout_secs = Some(1); // 1s timeout
+    cfg.max_retries = Some(1); // Fatal on first failure
+    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
+
+    let rid = RequestId::from("req-hang-nonstream");
+    // Wrap in a 10s guard so a broken timeout fails fast instead of hanging.
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.submit_and_collect(rid, user_request("hi")),
+    )
+    .await;
+    server.shutdown();
+
+    let result = result.expect("test itself should not time out");
+    assert!(result.is_err(), "hanging server should produce an error");
+    let err = result.unwrap_err();
+    // reqwest's RequestBuilder::timeout produces an Http error. When the
+    // retry budget is exhausted, clone_error launders the non-Clone
+    // reqwest::Error into EventStreamError (the closest retryable variant),
+    // so we accept any transport-level error here. The key assertion is
+    // that the request failed quickly instead of hanging forever.
+    assert!(
+        matches!(&err, SamplingError::Http(e) if e.is_timeout())
+            || matches!(&err, SamplingError::IdleTimeout { .. })
+            || matches!(&err, SamplingError::EventStreamError(_)),
+        "expected timeout or transport error, got {err:?}",
+    );
+}
+
+/// A streaming request to a server that never sends response headers must
+/// time out (via `execute_streaming`'s tokio::time::timeout wrapper) and
+/// produce an `IdleTimeout` — not hang forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_hang_times_out_and_retries() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let attempts = std::sync::Arc::new(AtomicU32::new(0));
+    let attempts_clone = std::sync::Arc::clone(&attempts);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let attempts = std::sync::Arc::clone(&attempts_clone);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let mut cfg = test_config(server.base_url(), "test-model");
+    cfg.stream = true;
+    cfg.request_timeout_secs = Some(1); // 1s response-header timeout
+    cfg.max_retries = Some(3); // allow retries to prove the timeout is retryable
+    // Tight time budget so the test finishes quickly.
+    let retry_policy = RetryPolicy {
+        max_retries: 30,
+        rate_limit_retry_threshold: 2,
+        retry_only_before_output: false,
+        max_retry_duration_secs: 3,
+    };
+    let handle = SamplerActor::spawn(cfg, retry_policy, event_tx);
+
+    let rid = RequestId::from("req-hang-stream");
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        handle.submit_and_collect(rid, user_request("hi")),
+    )
+    .await;
+    server.shutdown();
+
+    let result = result.expect("test itself should not time out");
+    assert!(result.is_err(), "hanging server should produce an error");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, SamplingError::IdleTimeout { .. }),
+        "streaming hang should surface as IdleTimeout, got {err:?}",
+    );
+    // At least 2 attempts means the timeout was classified as retryable.
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "expected >= 2 attempts (timeout should be retryable), got {}",
+        attempts.load(Ordering::SeqCst),
     );
 }
 

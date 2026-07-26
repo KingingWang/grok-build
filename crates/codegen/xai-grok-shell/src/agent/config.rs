@@ -5225,6 +5225,7 @@ pub(crate) fn sampling_config_for_model(
             .responses_system_prompt_as_instructions
             .unwrap_or(false),
         idle_timeout_secs: None,
+        request_timeout_secs: None,
         client_identifier: None,
         deployment_id,
         user_id,
