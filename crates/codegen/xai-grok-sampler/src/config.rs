@@ -85,6 +85,11 @@ pub struct SamplerConfig {
     #[serde(default)]
     pub responses_system_prompt_as_instructions: bool,
     pub idle_timeout_secs: Option<u64>,
+    /// Overall request timeout in seconds. Covers the full request for
+    /// non-streaming (send + body) and the response-header wait for
+    /// streaming; the L2 idle timeout covers inter-chunk gaps separately.
+    /// `None` falls back to [`DEFAULT_REQUEST_TIMEOUT_SECS`] (300s).
+    pub request_timeout_secs: Option<u64>,
 
     // Reasoning effort
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -179,6 +184,7 @@ impl Default for SamplerConfig {
             stream: true,
             responses_system_prompt_as_instructions: false,
             idle_timeout_secs: None,
+            request_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,
             client_identifier: None,
@@ -235,6 +241,13 @@ pub struct RetryPolicy {
 
 /// Default total retry time budget: 10 minutes.
 pub const DEFAULT_MAX_RETRY_DURATION_SECS: u64 = 600;
+
+/// Default overall request timeout in seconds. Covers the full request
+/// lifecycle for non-streaming (send + body read) and the response-header
+/// wait for streaming. The L2 per-chunk idle timeout
+/// ([`SamplerConfig::idle_timeout_secs`]) covers inter-chunk gaps
+/// separately. Default 300s (5 min), matching the default idle timeout.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 fn default_max_retry_duration_secs() -> u64 {
     DEFAULT_MAX_RETRY_DURATION_SECS
