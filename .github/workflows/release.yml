@@ -10,7 +10,7 @@ on:
     inputs:
       tag:
         description: Existing v-prefixed tag to release
-        required: true
+        required: false
         type: string
 
 permissions:
@@ -25,19 +25,19 @@ env:
 
 jobs:
   prepare:
-    name: Validate release tag
+    name: Prepare release metadata
     runs-on: ubuntu-24.04
     outputs:
       commit: ${{ steps.release.outputs.commit }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Check out the release tag
+      - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: Resolve and validate the release
+      - name: Resolve release metadata
         id: release
         shell: bash
         env:
@@ -46,29 +46,25 @@ jobs:
           set -euo pipefail
 
           tag="$REQUESTED_TAG"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._]+)?$ ]]; then
-            # Not a release tag — build-only run (e.g. push to main).
-            # Skip tag/version validation; use the commit SHA as the
-            # version for artifact naming.
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._]+)?$ ]]; then
+            # Explicit release tag push or workflow_dispatch with tag.
+            commit="$(git rev-parse --verify "refs/tags/${tag}^{commit}")"
+            version="${tag#v}"
+            test -f Cargo.lock
+
+            manifest_version="$(python3 -c 'import tomllib; print(tomllib.load(open("crates/codegen/xai-grok-pager-bin/Cargo.toml", "rb"))["package"]["version"])')"
+
+            if [[ "$version" != "$manifest_version" ]]; then
+              echo "Tag version $version does not match package version $manifest_version" >&2
+              exit 1
+            fi
+          else
+            # Branch push (e.g. main) — generate a rolling release tag.
             commit="$GITHUB_SHA"
-            version="$(git rev-parse --short HEAD)"
-            {
-              echo "commit=$commit"
-              echo "tag="
-              echo "version=$version"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          commit="$(git rev-parse --verify "refs/tags/${tag}^{commit}")"
-          version="${tag#v}"
-          test -f Cargo.lock
-
-          manifest_version="$(python3 -c 'import tomllib; print(tomllib.load(open("crates/codegen/xai-grok-pager-bin/Cargo.toml", "rb"))["package"]["version"])')"
-
-          if [[ "$version" != "$manifest_version" ]]; then
-            echo "Tag version $version does not match package version $manifest_version" >&2
-            exit 1
+            manifest_version="$(python3 -c 'import tomllib; print(tomllib.load(open("crates/codegen/xai-grok-pager-bin/Cargo.toml", "rb"))["package"]["version"])')"
+            short_sha="$(git rev-parse --short HEAD)"
+            tag="v${manifest_version}-${short_sha}"
+            version="${manifest_version}-${short_sha}"
           fi
 
           {
@@ -99,10 +95,10 @@ jobs:
             target: aarch64-apple-darwin
             platform: macos-aarch64
           - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             platform: linux-x86_64
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             platform: linux-aarch64
 
     steps:
@@ -121,7 +117,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --yes protobuf-compiler
+          sudo apt-get install --yes protobuf-compiler musl-tools
           echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
           protoc --version
 
@@ -136,7 +132,7 @@ jobs:
       - name: Build the distribution binary
         run: cargo build --locked --profile release-dist --target ${{ matrix.target }} -p xai-grok-pager-bin --features release-dist
 
-      - name: Package and smoke-test the Unix binary
+      - name: Package and smoke-test the binary
         shell: bash
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -174,11 +170,16 @@ jobs:
     needs:
       - prepare
       - build
-    if: needs.prepare.outputs.tag != ''
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          fetch-depth: 0
+
       - name: Download all prebuilt binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -216,9 +217,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           set -euo pipefail
           cd release-assets
+
+          # Ensure the tag exists (for rolling releases from branch pushes).
+          if ! git rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            git tag "$TAG" "$COMMIT"
+            git push origin "refs/tags/${TAG}"
+          fi
 
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
