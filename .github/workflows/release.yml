@@ -112,7 +112,7 @@ jobs:
           rustup show active-toolchain
           rustup target add ${{ matrix.target }}
 
-      - name: Install protoc on Linux
+      - name: Install protoc and musl toolchain on Linux
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -120,6 +120,17 @@ jobs:
           sudo apt-get install --yes protobuf-compiler musl-tools
           echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
           protoc --version
+
+          # sqlite-vec expects BSD u_int*_t typedefs absent in musl headers.
+          cat > /tmp/musl-bsd-compat.h << 'HDR'
+          #include <stdint.h>
+          typedef uint8_t  u_int8_t;
+          typedef uint16_t u_int16_t;
+          typedef uint32_t u_int32_t;
+          typedef uint64_t u_int64_t;
+          HDR
+          echo "CFLAGS=-include /tmp/musl-bsd-compat.h" >> "$GITHUB_ENV"
+
 
       - name: Install protoc on macOS
         if: runner.os == 'macOS'
