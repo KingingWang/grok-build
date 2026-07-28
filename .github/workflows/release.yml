@@ -132,9 +132,19 @@ jobs:
           target_lower="$(echo "$TARGET" | tr '-' '_')"
           echo "CFLAGS_${target_lower}=-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t" >> "$GITHUB_ENV"
 
-          # jemalloc's configure misdetects C11 atomics on musl (especially aarch64).
-          # Defining __STDC_NO_ATOMICS__ forces fallback to GCC __atomic builtins.
-          echo "CFLAGS=-D__STDC_NO_ATOMICS__=1" >> "$GITHUB_ENV"
+          # jemalloc's configure misdetects C11 atomics on musl (especially
+          # aarch64): the link test passes but the real compilation fails because
+          # musl's <stdatomic.h> lacks atomic_memory_order_relaxed, breaking the
+          # build, instead of fighting configure, pre-seed its cache via a
+          # config.site file so C11 atomics are skipped and GCC __atomic builtins
+          # (which work correctly on musl) are used instead.
+          site_dir="$(mktemp -d)"
+          {
+            echo "je_cv_c11_atomics=no"
+            echo "je_cv_gcc_atomic_atomics=yes"
+            echo "je_cv_gcc_u8_atomic_atomics=yes"
+          } > "$site_dir/config.site"
+          echo "CONFIG_SITE=$site_dir/config.site" >> "$GITHUB_ENV"
 
 
       - name: Install protoc on macOS
