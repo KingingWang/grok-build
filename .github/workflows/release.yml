@@ -132,6 +132,10 @@ jobs:
           target_lower="$(echo "$TARGET" | tr '-' '_')"
           echo "CFLAGS_${target_lower}=-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t" >> "$GITHUB_ENV"
 
+          # jemalloc's configure misdetects C11 atomics on musl (especially aarch64).
+          # Defining __STDC_NO_ATOMICS__ forces fallback to GCC __atomic builtins.
+          echo "CFLAGS=-D__STDC_NO_ATOMICS__=1" >> "$GITHUB_ENV"
+
 
       - name: Install protoc on macOS
         if: runner.os == 'macOS'
