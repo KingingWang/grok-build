@@ -115,15 +115,22 @@ jobs:
       - name: Install protoc and musl toolchain on Linux
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           sudo apt-get update
           sudo apt-get install --yes protobuf-compiler musl-tools
           echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
           protoc --version
 
+          # Force musl-gcc as linker so the final binary is fully static.
+          target_upper="$(echo "$TARGET" | tr 'a-z-' 'A-Z_')"
+          echo "CARGO_TARGET_${target_upper}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+
           # sqlite-vec expects BSD u_int*_t typedefs absent in musl headers.
-          # Use -D defines (safe for asm) instead of -include (breaks .S files).
-          echo "CFLAGS=-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t" >> "$GITHUB_ENV"
+          # Use target-specific CFLAGS (cc-rs only) so jemalloc's make is unaffected.
+          target_lower="$(echo "$TARGET" | tr '-' '_')"
+          echo "CFLAGS_${target_lower}=-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t" >> "$GITHUB_ENV"
 
 
       - name: Install protoc on macOS
