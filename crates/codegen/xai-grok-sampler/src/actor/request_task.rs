@@ -18,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use xai_grok_sampling_types::{
-    ConversationRequest, ConversationResponse, EmptyResponseContext, SamplingError, SentCredential,
-    error::Result as SamplingResult,
+    AssistantItem, ConversationItem, ConversationRequest, ConversationResponse,
+    EmptyResponseContext, SamplingError, SentCredential, StopReason, TokenUsage, ToolCall,
+    error::Result as SamplingResult, messages, reported_cost_ticks, rs, synthesized_reasoning_item,
 };
 
 use crate::client::{ApiBackend, SamplingClient};
@@ -838,6 +839,9 @@ fn conversation_response_from_chat(
         message_chunks_emitted: 0,
         doom_loop_signals: Vec::new(),
         stop_message: None,
+        message_id: None,
+        raw_stop_reason: None,
+        stop_sequence: None,
     }
 }
 
@@ -857,6 +861,7 @@ fn conversation_response_from_messages(resp: messages::MessagesResponse) -> Conv
     use xai_grok_sampling_types::messages::ContentBlock;
 
     let model = resp.model.clone();
+    let resp_id = resp.id.clone();
     let mut content = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut reasoning: Option<String> = None;
@@ -869,7 +874,7 @@ fn conversation_response_from_messages(resp: messages::MessagesResponse) -> Conv
                 }
                 content.push_str(&text);
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse { id, name, input, .. } => {
                 tool_calls.push(ToolCall {
                     id: Arc::<str>::from(id),
                     name,
@@ -904,6 +909,7 @@ fn conversation_response_from_messages(resp: messages::MessagesResponse) -> Conv
                 total_tokens: total_prompt.saturating_add(u.output_tokens),
                 reasoning_tokens: 0,
                 cached_prompt_tokens: u.cache_read_input_tokens,
+                cache_creation_prompt_tokens: u.cache_creation_input_tokens,
             })
         } else {
             None
@@ -931,6 +937,9 @@ fn conversation_response_from_messages(resp: messages::MessagesResponse) -> Conv
         message_chunks_emitted: 0,
         doom_loop_signals: Vec::new(),
         stop_message: None,
+        message_id: Some(resp_id),
+        raw_stop_reason: None,
+        stop_sequence: None,
     }
 }
 
