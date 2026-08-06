@@ -481,16 +481,24 @@ pub fn status_user_message(status: StatusCode) -> String {
         code @ 502..=504 => {
             format!("Grok is temporarily unavailable. Please try again in a moment. (HTTP {code}).")
         }
-        // Cloudflare edge codes (origin down / connect fail / timeout / …).
-        code @ 520..=524 => {
+        // Cloudflare upstream overload (529) — transient.
+        code @ 529 => {
+            format!("Grok is temporarily overloaded. Please try again in a moment. (HTTP {code}).")
+        }
+        // Cloudflare edge codes (origin down / connect fail / timeout / …),
+        // plus 530 (Cloudflare edge 1xxx) — same transient class.
+        code @ 520..=524 | code @ 530 => {
             format!(
                 "Connection to Grok timed out or was interrupted. Please try again. (HTTP {code})."
             )
         }
+        // Cloudflare origin TLS (handshake / invalid certificate) — not transient.
+        code @ 525 | code @ 526 => {
+            format!("Secure connection to Grok failed. (HTTP {code}).")
+        }
         code if status.is_server_error() => {
             format!("Something went wrong on the server (HTTP {code}).")
         }
-        code if status.is_client_error() => format!("Request failed (HTTP {code})."),
         code => format!("Request failed (HTTP {code})."),
     }
 }
