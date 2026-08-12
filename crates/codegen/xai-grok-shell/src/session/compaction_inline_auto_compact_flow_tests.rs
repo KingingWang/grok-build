@@ -68,6 +68,8 @@ async fn create_test_actor(
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
             stream_tool_calls: None,
+            stream: None,
+            responses_system_prompt_as_instructions: None,
         },
         Box::new(xai_chat_state::NullChatPersistence),
         chat_event_tx,

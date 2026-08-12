@@ -2324,6 +2324,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             api_backend: Default::default(),
             auth_scheme: Default::default(),
             extra_headers: Default::default(),
+            user_agent: None,
             query_params: Default::default(),
             env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(256_000).unwrap(),
@@ -2344,6 +2345,8 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            stream: None,
+            responses_system_prompt_as_instructions: None,
             laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
             variants: Vec::new(),
         },
@@ -2570,6 +2573,8 @@ fn test_sampling_config(model_slug: &str) -> xai_grok_sampling_types::SamplingCo
         context_window: NonZeroU64::new(256_000).expect("non-zero context window"),
         reasoning_effort: None,
         stream_tool_calls: None,
+        stream: None,
+        responses_system_prompt_as_instructions: None,
     }
 }
 fn spawn_test_parent_chat_state(model_slug: &str) -> xai_chat_state::ChatStateHandle {

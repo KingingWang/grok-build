@@ -2032,6 +2032,7 @@ fn make_entry_config_with_id(
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
         extra_headers: IndexMap::new(),
+        user_agent: None,
         api_base_url: None,
         use_concise: false,
         agent_type: config::default_agent_type(),
@@ -2049,6 +2050,8 @@ fn make_entry_config_with_id(
         compaction_at_tokens: None,
         show_model_fingerprint: false,
         stream_tool_calls: None,
+        stream: None,
+        responses_system_prompt_as_instructions: None,
         laziness_detector: config::LazinessDetectorPerModelConfig::default(),
         variants: Vec::new(),
     }
