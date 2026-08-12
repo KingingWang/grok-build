@@ -72,7 +72,10 @@ fn sampler_surfaces_429() -> xai_grok_sampler::RetryPolicy {
 
 fn sampler_retries_429() -> xai_grok_sampler::RetryPolicy {
     xai_grok_sampler::RetryPolicy {
-        max_retries: 5,
+        // The fork no longer caps 429 retries at `rate_limit_retry_threshold`;
+        // the sampler's own 429 budget is the retry count (and the time
+        // budget). 2 = one retry, so a persistent 429 still exhausts.
+        max_retries: 2,
         rate_limit_retry_threshold: xai_grok_sampler::RATE_LIMIT_RETRY_THRESHOLD,
         ..Default::default()
     }
