@@ -496,6 +496,7 @@ fn session_resolver_is_not_stamped_onto_third_party_samplers() {
     }
     let session_cfg = SamplerConfig {
         bearer_resolver: Some(std::sync::Arc::new(SessionResolver)),
+        auth_refresh_available: false,
         ..SamplerConfig::default()
     };
     let mut third_party = SamplerConfig {
@@ -1048,6 +1049,7 @@ fn test_model_entry(
             api_backend: ApiBackend::default(),
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
+            user_agent: None,
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -1067,6 +1069,8 @@ fn test_model_entry(
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            stream: None,
+            responses_system_prompt_as_instructions: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         api_key: api_key.map(|s| s.to_string()),
@@ -2123,6 +2127,7 @@ fn model_info_from_config_propagates_use_concise() {
         api_backend: ApiBackend::default(),
         auth_scheme: None,
         extra_headers: IndexMap::new(),
+        user_agent: None,
         context_window: NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
@@ -2141,6 +2146,8 @@ fn model_info_from_config_propagates_use_concise() {
         compaction_at_tokens: None,
         show_model_fingerprint: false,
         stream_tool_calls: None,
+        stream: None,
+        responses_system_prompt_as_instructions: None,
         laziness_detector: LazinessDetectorPerModelConfig::default(),
     };
     let info = ModelInfo::from_config(&entry);
@@ -2283,6 +2290,7 @@ fn model_info_from_config_propagates_agent_type() {
         api_backend: ApiBackend::default(),
         auth_scheme: None,
         extra_headers: IndexMap::new(),
+        user_agent: None,
         context_window: NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
@@ -2301,6 +2309,8 @@ fn model_info_from_config_propagates_agent_type() {
         compaction_at_tokens: None,
         show_model_fingerprint: false,
         stream_tool_calls: None,
+        stream: None,
+        responses_system_prompt_as_instructions: None,
         laziness_detector: LazinessDetectorPerModelConfig::default(),
     };
     let info = ModelInfo::from_config(&entry);
@@ -2735,6 +2745,7 @@ fn inference_idle_timeout_propagates_to_model_info() {
         api_backend: ApiBackend::default(),
         auth_scheme: None,
         extra_headers: IndexMap::new(),
+        user_agent: None,
         context_window: NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
         system_prompt_label: None,
@@ -2753,6 +2764,8 @@ fn inference_idle_timeout_propagates_to_model_info() {
         compaction_at_tokens: None,
         show_model_fingerprint: false,
         stream_tool_calls: None,
+        stream: None,
+        responses_system_prompt_as_instructions: None,
         laziness_detector: LazinessDetectorPerModelConfig::default(),
     };
     let info = ModelInfo::from_config(&entry);
@@ -6710,6 +6723,7 @@ fn prefetch_model_entry(slug: &str, context_window: u64, api_backend: ApiBackend
             api_backend,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
+            user_agent: None,
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: NonZeroU64::new(context_window).unwrap(),
@@ -6727,6 +6741,8 @@ fn prefetch_model_entry(slug: &str, context_window: u64, api_backend: ApiBackend
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            stream: None,
+            responses_system_prompt_as_instructions: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
@@ -6844,6 +6860,90 @@ fn global_extra_headers_apply_to_prefetched_model() {
             .map(String::as_str),
         Some("team=example,env=prod"),
         "global [models].extra_headers must cover models from /v1/models"
+    );
+}
+#[test]
+fn global_user_agent_and_responses_defaults_reach_sampler_config() {
+    let dm = crate::models::default_model();
+    let (_, models) = resolve_models_from_toml(
+        r#"
+        [models]
+        user_agent = "global-agent/1.0"
+        responses_system_prompt_as_instructions = true
+        "#,
+        None,
+    );
+    let model = models.get(dm).expect("default model should exist");
+    assert_eq!(model.info.user_agent.as_deref(), Some("global-agent/1.0"));
+    assert_eq!(
+        model.info.responses_system_prompt_as_instructions,
+        Some(true)
+    );
+
+    let sampling = resolve_sampling(model, None);
+    assert_eq!(
+        sampling.extra_headers.get("user-agent").map(String::as_str),
+        Some("global-agent/1.0")
+    );
+    assert!(sampling.responses_system_prompt_as_instructions);
+}
+#[test]
+fn per_model_user_agent_and_responses_setting_override_global_defaults() {
+    let dm = crate::models::default_model();
+    let (_, models) = resolve_models_from_toml(
+        &format!(
+            r#"
+            [models]
+            user_agent = "global-agent/1.0"
+            responses_system_prompt_as_instructions = true
+
+            [model."{dm}"]
+            user_agent = "model-agent/2.0"
+            responses_system_prompt_as_instructions = false
+            extra_headers = {{ "User-Agent" = "legacy-header-agent/0.1" }}
+            "#,
+        ),
+        None,
+    );
+    let model = models.get(dm).expect("default model should exist");
+    assert_eq!(model.info.user_agent.as_deref(), Some("model-agent/2.0"));
+    assert_eq!(
+        model.info.responses_system_prompt_as_instructions,
+        Some(false)
+    );
+
+    let sampling = resolve_sampling(model, None);
+    let user_agents: Vec<&str> = sampling
+        .extra_headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(user_agents, vec!["model-agent/2.0"]);
+    assert!(!sampling.responses_system_prompt_as_instructions);
+}
+#[test]
+fn global_user_agent_does_not_override_per_model_user_agent_header() {
+    let dm = crate::models::default_model();
+    let (_, models) = resolve_models_from_toml(
+        &format!(
+            r#"
+            [models]
+            user_agent = "global-agent/1.0"
+
+            [model."{dm}"]
+            extra_headers = {{ "USER-AGENT" = "header-agent/3.0" }}
+            "#,
+        ),
+        None,
+    );
+    let model = models.get(dm).expect("default model should exist");
+    assert_eq!(model.info.user_agent, None);
+
+    let sampling = resolve_sampling(model, None);
+    assert_eq!(
+        sampling.extra_headers.get("USER-AGENT").map(String::as_str),
+        Some("header-agent/3.0")
     );
 }
 #[test]
