@@ -409,14 +409,30 @@ impl SamplingError {
 
     pub fn is_retryable(&self) -> bool {
         match self {
-            SamplingError::Auth { .. } => false,
+            // `Auth` covers both a client-side bearer construction failure
+            // and a server 401 (the HTTP client lifts a 401 response into
+            // `Auth(...)`). It is retryable: refresh-capable models have
+            // the first 401 intercepted in `apply_retry_decision` (emitted
+            // to the session for a one-shot refresh); static-BYOK models
+            // retry in-loop with backoff. A misconfigured model with no key
+            // at all will retry uselessly up to the time budget — accepted
+            // edge case.
+            SamplingError::Auth { .. } => true,
             SamplingError::InvalidConfiguration(_) => false,
             SamplingError::Http(err) => is_retryable_reqwest(err),
             SamplingError::Serialization(_) => false,
-            SamplingError::Api { status, .. } => is_retryable_api_status(*status),
+            // All HTTP status codes are retryable. The caller's retry loop
+            // enforces a total time budget (default 10 min), so even
+            // deterministic-looking 4xx (400/403/404/408/422) are retried
+            // up to that cap rather than failing the turn immediately.
+            // 401 is intercepted earlier (auth-refresh path) before this
+            // method is consulted.
+            SamplingError::Api { .. } => true,
             SamplingError::EventStreamError(_) => true,
             SamplingError::StreamError { .. } => true,
-            SamplingError::IdleTimeout { .. } => false,
+            // Model stuck: a fresh sample is the remedy, so retry within
+            // the time budget instead of failing immediately.
+            SamplingError::IdleTimeout { .. } => true,
             SamplingError::EmptyResponse { .. } => true,
             SamplingError::MaxTokensTruncation => false,
             SamplingError::DoomLoopDetected { .. } => true,
@@ -993,12 +1009,11 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_is_not_retryable() {
+    fn idle_timeout_is_retryable() {
+        // IdleTimeout is now retried within the time budget — a fresh sample
+        // may complete where the previous one stalled.
         let err = SamplingError::IdleTimeout { elapsed_secs: 300 };
-        assert!(
-            !err.is_retryable(),
-            "IdleTimeout must not be retried — would cause 3× amplification"
-        );
+        assert!(err.is_retryable(), "IdleTimeout should be retryable");
     }
 
     #[test]
@@ -1388,9 +1403,14 @@ mod tests {
             error_code: None,
         };
         assert!(err.is_encrypted_content_error());
+        // Under the time-budget retry policy, every HTTP error code reports
+        // `is_retryable() == true`. Encrypted-content errors are still
+        // intercepted earlier in `classify_error` (emitted to the session
+        // rather than retried in-loop), so `is_retryable()` no longer gates
+        // that decision.
         assert!(
-            !err.is_retryable(),
-            "encrypted_content errors must not be retried"
+            err.is_retryable(),
+            "all HTTP error codes report retryable under the time-budget policy"
         );
     }
 
@@ -1496,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn image_processing_error_400_is_not_retryable_standalone() {
+    fn image_processing_error_400_reports_retryable() {
         let err = SamplingError::Api {
             status: StatusCode::BAD_REQUEST,
             message: "Could not process image".into(),
@@ -1505,10 +1525,11 @@ mod tests {
             should_retry: None,
             error_code: None,
         };
-        assert!(
-            !err.is_retryable(),
-            "direct 400 must not be retryable by is_retryable()"
-        );
+        assert!(err.is_image_processing_error());
+        // `is_retryable()` is true for every HTTP error code under the
+        // time-budget policy; image-strip recovery is decided in
+        // `classify_error`, not here.
+        assert!(err.is_retryable());
     }
 
     fn api_400(message: &str) -> SamplingError {
@@ -1669,8 +1690,8 @@ mod tests {
         // Origin TLS: a broken certificate never clears on its own.
         for code in [525u16, 526] {
             assert!(
-                !api_status_err(code).is_retryable(),
-                "origin-TLS {code} must not be retried"
+                api_status_err(code).is_retryable(),
+                "origin-TLS {code} must be retried under time-budget policy"
             );
         }
     }

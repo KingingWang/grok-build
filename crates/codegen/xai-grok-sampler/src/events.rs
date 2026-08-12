@@ -464,7 +464,9 @@ mod tests {
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Auth);
         assert_eq!(info.status_code, None);
-        assert!(!info.is_retryable);
+        // `Auth` is retryable: refresh-capable models get the first 401
+        // intercepted (emitted to session), static-BYOK models retry in-loop.
+        assert!(info.is_retryable);
         assert_eq!(info.retry_after_secs, None);
         assert!(info.model_metadata.is_none());
         assert!(info.message.contains("bad token"));
@@ -534,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn api_400_classified_as_api_and_not_retryable() {
+    fn api_400_classified_as_api_and_retryable() {
         let err = SamplingError::Api {
             status: StatusCode::BAD_REQUEST,
             message: "context window exceeded".into(),
@@ -549,7 +551,10 @@ mod tests {
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Api);
         assert_eq!(info.status_code, Some(400));
-        assert!(!info.is_retryable, "4xx (non-429) should not be retryable");
+        assert!(
+            info.is_retryable,
+            "all HTTP error codes are retryable under the time-budget policy"
+        );
         let metadata = info.model_metadata.expect("metadata preserved");
         assert_eq!(metadata.context_window, Some(8000));
     }
@@ -576,11 +581,14 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_classified_as_idle_timeout_and_not_retryable() {
+    fn idle_timeout_classified_as_idle_timeout_and_retryable() {
         let err = SamplingError::IdleTimeout { elapsed_secs: 300 };
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::IdleTimeout);
-        assert!(!info.is_retryable);
+        assert!(
+            info.is_retryable,
+            "IdleTimeout is retried (a fresh sample may complete)"
+        );
         assert!(info.message.contains("300s"));
     }
 
