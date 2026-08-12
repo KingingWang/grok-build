@@ -662,6 +662,10 @@ pub struct ConversationRequest {
     pub prompt_cache_key: Option<String>,
     /// What the sampler does when the response stops with `Length`.
     pub length_policy: LengthPolicy,
+    /// When true, Responses API system messages are sent through the top-level
+    /// `instructions` field instead of `input` items with `role: "system"`.
+    /// This is required by some OpenAI-compatible third-party endpoints.
+    pub responses_system_prompt_as_instructions: bool,
 }
 
 impl ConversationRequest {

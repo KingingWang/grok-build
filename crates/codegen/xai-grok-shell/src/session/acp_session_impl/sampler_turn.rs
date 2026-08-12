@@ -658,6 +658,8 @@ impl SessionActor {
                 reasoning_effort: None,
                 reasoning_summary: None,
                 stream_tool_calls: None,
+                stream: None,
+                responses_system_prompt_as_instructions: None,
             });
         let creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
@@ -723,6 +725,12 @@ impl SessionActor {
             &cfg.base_url,
         );
         let request_compression = crate::util::config::request_compression_for_url(&cfg.base_url);
+        // Whether the session can reactively refresh on a 401 (OAuth session
+        // refresh, auth_provider re-mint, devbox). Computed before the
+        // literal moves `cfg.model`.
+        let auth_refresh_available = use_bearer_resolver
+            || self.model_auth_provider(&cfg.model).is_some()
+            || crate::auth::devbox_login::is_devbox_environment();
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
@@ -732,6 +740,10 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             api_backend: cfg.api_backend,
+            stream: cfg.stream.unwrap_or(true),
+            responses_system_prompt_as_instructions: cfg
+                .responses_system_prompt_as_instructions
+                .unwrap_or(false),
             auth_scheme,
             request_compression,
             extra_headers,
@@ -748,6 +760,7 @@ impl SessionActor {
             rate_limit_retry_threshold: cfg.rate_limit_retry_threshold,
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
             idle_timeout_secs: None,
+            request_timeout_secs: None,
             client_identifier: self.client_identifier.clone(),
             deployment_id: crate::managed_config::resolve_deployment_id(
                 crate::managed_config::resolve_deployment_key().as_deref(),
@@ -771,6 +784,9 @@ impl SessionActor {
             } else {
                 None
             },
+            // See `auth_refresh_available` above; static BYOK has no refresh
+            // mechanism, so its 401s retry in-loop with backoff instead.
+            auth_refresh_available,
             supports_backend_search: self.supports_backend_search.get(),
             compactions_remaining: self.compactions_remaining.get(),
             compaction_at_tokens: self.compaction_at_tokens.get(),
