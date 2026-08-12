@@ -713,6 +713,7 @@ pub(crate) fn parse_remote_model_value(
             .or_else(|| get_string(obj, "system_prompt_label"))
             .filter(|s| !s.trim().is_empty()),
         extra_headers: get_string_map(obj, "extraHeaders"),
+        user_agent: None,
         api_base_url: get_string(obj, "apiBaseUrl")
             .or_else(|| get_string(obj, "api_base_url")),
         use_concise: obj
@@ -744,6 +745,7 @@ pub(crate) fn parse_remote_model_value(
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
         auth_scheme: None,
+        responses_system_prompt_as_instructions: None,
         reasoning_effort: get_string(obj, "reasoningEffort")
             .or_else(|| get_string(obj, "reasoning_effort"))
             .or_else(|| meta.and_then(|m| get_string(m, "reasoningEffort")))
@@ -810,6 +812,7 @@ pub(crate) fn parse_remote_model_value(
             .get("reasoningSummary")
             .or_else(|| obj.get("reasoning_summary"))
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        stream: None,
         laziness_detector: get_object(obj, "lazinessDetector")
             .or_else(|| get_object(obj, "laziness_detector"))
             .or_else(|| meta.and_then(|m| get_object(m, "lazinessDetector")))
