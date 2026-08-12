@@ -76,6 +76,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         // Keep retries minimal so tests don't take forever.
         max_retries: Some(2),
         idle_timeout_secs: Some(30),
+        stream: false,
         ..Default::default()
     }
 }
