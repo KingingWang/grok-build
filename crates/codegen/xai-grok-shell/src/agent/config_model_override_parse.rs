@@ -681,6 +681,7 @@ mod tests {
             extra_headers: [("x-team".to_owned(), "codegen".to_owned())]
                 .into_iter()
                 .collect(),
+            user_agent: None,
             query_params: [("api-version".to_owned(), "2026-07-22".to_owned())]
                 .into_iter()
                 .collect(),
@@ -711,6 +712,8 @@ mod tests {
             compaction_at_tokens: Some(CompactionAtTokens::Fixed(100_000)),
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
+            stream: None,
+            responses_system_prompt_as_instructions: None,
         }
     }
 

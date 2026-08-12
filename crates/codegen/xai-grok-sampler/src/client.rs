@@ -21,6 +21,7 @@ use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 use serde::Serialize;
+use std::time::Duration;
 use tracing::Instrument;
 
 use xai_grok_sampling_types::error::{
@@ -34,7 +35,7 @@ use xai_grok_sampling_types::{
     is_check_event, messages, rs,
 };
 
-use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
+use crate::config::{AuthScheme, DEFAULT_REQUEST_TIMEOUT_SECS, OriginClientInfo, SamplerConfig};
 use crate::events::SamplingErrorInfo;
 use crate::span_timing::{ERROR, STATUS_CODE, SUCCESS, StreamSpanTiming};
 use crate::stream_classify::{chat_chunk_class, message_event_class, responses_event_class};
@@ -87,15 +88,50 @@ impl GrokRequestHeaders<'_> {
     }
 }
 
-/// Deserialize a Responses SSE event, stripping unknown tools and rewriting terminal `total_tokens` from `context_details`.
-pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
+/// Deserialize a Responses API SSE event, with a fallback for xAI-specific
+/// tool types (e.g., `x_search`) that `async_openai` can't parse.
+///
+/// The API echoes the request's `tools` array in `ResponseCompleted` and
+/// `ResponseCreated` events. If we sent `{"type": "x_search"}`, the response
+/// includes it, and `rs::Tool` deserialization fails. On failure, we strip
+/// unrecognized tools from the raw JSON and retry.
+///
+/// On `response.completed` / `response.incomplete`, this also rewrites
+/// `response.usage.total_tokens` in place to the live context length
+/// (`context_details.input_tokens + context_details.output_tokens`)
+/// when the API emits the xAI-specific `context_details` field.
+/// Async-openai's typed `ResponseUsage` doesn't model `context_details`,
+/// so we peek the raw JSON for it. The cumulative `input_tokens` /
+/// `output_tokens` / `cached_tokens` continue to flow from the typed
+/// `ResponseUsage` unchanged so billing telemetry stays correct. When
+/// the API doesn't emit `context_details` (older deployments) `total_tokens`
+/// passes through unchanged.
+fn deserialize_response_event(data: &str) -> Result<Option<rs::ResponseStreamEvent>> {
     let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
         Ok(event) => event,
         Err(first_err) => {
             // Try sanitizing: parse as Value, strip unknown tools, retry.
             if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
-                // Strip tools that async_openai's rs::Tool can't deserialize (e.g., xAI-specific "x_search")
-                // Instead of maintaining a hardcoded allowlist, try deserializing each tool entry; if it fails, drop it
+                // Some OpenAI-compatible providers emit a non-standard
+                // metadata-only event. It carries no model output and is not
+                // represented by async-openai's ResponseStreamEvent enum, so
+                // ignore this one explicitly while preserving strict errors
+                // for every other unknown event type.
+                if value.get("type").and_then(serde_json::Value::as_str)
+                    == Some("response.metadata")
+                {
+                    tracing::debug!(
+                        target: crate::sampling_log::TARGET,
+                        event = "response.metadata",
+                        "ignoring Responses API metadata extension event"
+                    );
+                    return Ok(None);
+                }
+
+                // Strip tools that async_openai's rs::Tool can't deserialize
+                // (e.g., xAI-specific "x_search"). Instead of maintaining a
+                // hardcoded allowlist, try deserializing each tool entry —
+                // if it fails, drop it.
                 if let Some(tools) = value
                     .pointer_mut("/response/tools")
                     .and_then(|v| v.as_array_mut())
@@ -104,7 +140,7 @@ pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStrea
                 }
                 if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
                     apply_terminal_event_overrides(&mut event, data);
-                    return Ok(event);
+                    return Ok(Some(event));
                 }
             }
             tracing::error!(
@@ -116,7 +152,7 @@ pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStrea
         }
     };
     apply_terminal_event_overrides(&mut event, data);
-    Ok(event)
+    Ok(Some(event))
 }
 
 /// On `response.completed` / `response.incomplete`, rewrite `usage.total_tokens` to the live context length from `context_details`.
@@ -163,6 +199,15 @@ fn extract_context_total(value: &serde_json::Value) -> Option<u32> {
     let i = u32::try_from(cd.get("input_tokens")?.as_u64()?).ok()?;
     let o = u32::try_from(cd.get("output_tokens")?.as_u64()?).ok()?;
     Some(i.saturating_add(o))
+}
+
+
+/// Record `success=false` and `error` on the active inference span when a stream request fails before any response (transport/connect/TLS errors).
+/// Otherwise the `#[instrument]` span closes with both fields Empty, an outage shows zero `success=false`, and error-rate alerts never fire.
+fn record_stream_request_failure(err: &reqwest::Error) {
+    let span = tracing::Span::current();
+    span.record("success", false);
+    span.record("error", err.to_string().as_str());
 }
 
 /// Splice the raw-JSON hosted-tool entries for `web_search` and `x_search` into a serialized Responses request body's `tools` array.
@@ -319,6 +364,10 @@ pub struct SamplingClient {
     header_injector: Option<crate::config::SharedHeaderInjector>,
     /// Endpoint URL builder, resolved once from `base_url` and `query_params`.
     endpoint: EndpointTemplate,
+    /// Overall request timeout for non-streaming (send + body) and
+    /// response-header wait for streaming. Resolved from
+    /// `config.request_timeout_secs` at construction.
+    request_timeout: Duration,
     first_use_noted: Arc<AtomicBool>,
 }
 
@@ -332,6 +381,7 @@ impl std::fmt::Debug for SamplingClient {
                 &self.attribution_callback.is_some(),
             )
             .field("has_bearer_resolver", &self.bearer_resolver.is_some())
+            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -346,6 +396,7 @@ struct ClientDefaults {
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
     extra_response_includes: Vec<String>,
+    responses_system_prompt_as_instructions: bool,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
 
@@ -540,8 +591,24 @@ impl SamplingClient {
             }
         }
 
-        // Apply all extra headers verbatim
-        // This is the single injection point for proxy-auth headers and any other URL- or environment-specific headers the session decides to set
+        // Install the generated default before configured headers so an
+        // explicit user-agent in `extra_headers` or `env_http_headers` wins.
+        {
+            let ua_string = match config.origin_client.as_ref() {
+                Some(origin) => user_agent_string_for(origin),
+                None => user_agent_string_for(&OriginClientInfo {
+                    product: AGENT_PRODUCT.to_string(),
+                    version: Some(agent_version()),
+                }),
+            };
+            if let Ok(v) = HeaderValue::from_str(&ua_string) {
+                headers.insert(USER_AGENT, v);
+            }
+        }
+
+        // Apply all extra headers verbatim. This is the single
+        // injection point for proxy-auth headers and any other URL- or
+        // environment-specific headers the session decides to set.
         for (key, value) in &config.extra_headers {
             let header_name = HeaderName::try_from(key.as_str())
                 .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header name"))?;
@@ -595,20 +662,6 @@ impl SamplingClient {
             }
         }
 
-        // Always set User-Agent: per-session origin if available, else fallback.
-        {
-            let ua_string = match config.origin_client.as_ref() {
-                Some(origin) => user_agent_string_for(origin),
-                None => user_agent_string_for(&OriginClientInfo {
-                    product: AGENT_PRODUCT.to_string(),
-                    version: Some(agent_version()),
-                }),
-            };
-            if let Ok(v) = HeaderValue::from_str(&ua_string) {
-                headers.insert(USER_AGENT, v);
-            }
-        }
-
         let http = if config.force_http1 {
             tracing::info!("Using HTTP/1.1 for sampling client (force_http1=true)");
             crate::shared_http::client_http1().map_err(SamplingError::Http)?
@@ -640,10 +693,16 @@ impl SamplingClient {
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
             extra_response_includes: config.extra_response_includes,
+            responses_system_prompt_as_instructions: config.responses_system_prompt_as_instructions,
             doom_loop_recovery: config.doom_loop_recovery,
         };
 
         let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
+        let request_timeout = Duration::from_secs(
+            config
+                .request_timeout_secs
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+        );
 
         Ok(Self {
             http,
@@ -654,6 +713,7 @@ impl SamplingClient {
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
             endpoint,
+            request_timeout,
             first_use_noted: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -738,9 +798,24 @@ impl SamplingClient {
         raw.map(|s| bearer_suffix(s).to_string())
     }
 
-    /// Best-effort *build-time* view of what the next request would carry (resolver-authoritative).
-    /// For request-start diagnostics ([`Self::auth_info`]) only.
-    /// 401 attribution must use the fragment captured by [`Self::post`], which cannot race a recovery.
+    /// Like [`Self::post`] but with an overall request timeout applied via
+    /// `RequestBuilder::timeout`. Use for non-streaming requests where the
+    /// entire response (headers + body) must arrive within
+    /// [`Self::request_timeout`]; streaming requests should use
+    /// [`Self::post`] plus [`Self::execute_stream_request`] instead — the L2
+    /// per-chunk idle timeout covers inter-chunk gaps once the stream starts.
+    fn post_timed(&self, url: impl reqwest::IntoUrl) -> SentRequest {
+        let sent = self.post(url);
+        SentRequest {
+            builder: sent.builder.timeout(self.request_timeout),
+            sent_bearer: sent.sent_bearer,
+        }
+    }
+
+    /// Best-effort *build-time* view of what the next request would carry
+    /// (resolver-authoritative). For request-start diagnostics
+    /// ([`Self::auth_info`]) only — 401 attribution must use the fragment
+    /// captured by [`Self::post`] instead, which cannot race a recovery.
     fn current_sent_bearer_suffix(&self) -> Option<String> {
         if self.bearer_resolver.is_some() {
             return self
@@ -916,7 +991,7 @@ impl SamplingClient {
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post(self.endpoint("chat/completions"));
+        } = self.post_timed(self.endpoint("chat/completions"));
         let http_request = grok_headers.apply(builder).json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
@@ -928,19 +1003,41 @@ impl SamplingClient {
         self.handle_response(response, sent_bearer.as_deref()).await
     }
 
+    /// Execute a pre-built streaming request, wrapping `http.execute` in
+    /// a timeout that covers the response-header wait. Once headers arrive,
+    /// the L2 per-chunk idle timeout covers inter-chunk gaps. A timeout here
+    /// produces `IdleTimeout` (retryable with exponential backoff).
     async fn execute_stream_request(
         &self,
         built_request: reqwest::Request,
         span_timing: &mut StreamSpanTiming,
     ) -> Result<reqwest::Response> {
         span_timing.record_request_build();
-        let response = self.http.execute(built_request).await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {}", e);
-            span_timing.record_transport_failure(&e.to_string());
-            e
-        })?;
+        let timeout = self.request_timeout;
+        let executed = match tokio::time::timeout(timeout, self.http.execute(built_request)).await
+        {
+            Ok(result) => result.map_err(|e| {
+                tracing::debug!("HTTP request failed: {}", e);
+                span_timing.record_transport_failure(&e.to_string());
+                record_stream_request_failure(&e);
+                SamplingError::from(e)
+            }),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: crate::sampling_log::TARGET,
+                    elapsed_secs = timeout.as_secs(),
+                    "streaming request timed out waiting for response headers",
+                );
+                let span = tracing::Span::current();
+                span.record("success", false);
+                span.record("error", "request timeout (no response headers)");
+                Err(SamplingError::IdleTimeout {
+                    elapsed_secs: timeout.as_secs(),
+                })
+            }
+        }?;
         span_timing.record_response_headers();
-        Ok(response)
+        Ok(executed)
     }
 
     /// Start a streaming chat completion request. Returns a stream of typed chunks.
@@ -1215,7 +1312,7 @@ impl SamplingClient {
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post(self.endpoint("responses"));
+        } = self.post_timed(self.endpoint("responses"));
         let http_request = grok_headers.apply(builder).json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1485,7 +1582,11 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            Some(Some(deserialize_response_event(data)))
+                            match deserialize_response_event(data) {
+                                Ok(Some(event)) => Some(Some(Ok(event))),
+                                Ok(None) => Some(None),
+                                Err(err) => Some(Some(Err(err))),
+                            }
                         }
                     }
                     Err(e) => {
@@ -1563,7 +1664,7 @@ impl SamplingClient {
         let SentRequest {
             builder,
             sent_bearer,
-        } = self.post(self.endpoint("messages"));
+        } = self.post_timed(self.endpoint("messages"));
         let http_request = grok_headers.apply(builder).json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1841,6 +1942,9 @@ impl SamplingClient {
         if request.max_output_tokens.is_none() {
             request.max_output_tokens = self.defaults.max_completion_tokens;
         }
+
+        request.responses_system_prompt_as_instructions =
+            self.defaults.responses_system_prompt_as_instructions;
 
         Ok(())
     }
@@ -2221,7 +2325,10 @@ mod tests {
             force_http1: false,
             max_retries: None,
             stream_tool_calls: false,
+            stream: true,
+            responses_system_prompt_as_instructions: false,
             idle_timeout_secs: None,
+            request_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,
             client_identifier: None,
@@ -2230,6 +2337,7 @@ mod tests {
             client_version: None,
             attribution_callback: None,
             bearer_resolver: None,
+            auth_refresh_available: false,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,
@@ -2597,6 +2705,60 @@ mod tests {
         assert!(client.default_headers.contains_key(USER_AGENT));
     }
 
+    #[test]
+    fn sampling_client_uses_configured_user_agent() {
+        let mut config = minimal_config();
+        config
+            .extra_headers
+            .insert("User-Agent".to_string(), "custom-client/1.0".to_string());
+
+        let client = SamplingClient::new(config).expect("build");
+        assert_eq!(
+            client
+                .default_headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("custom-client/1.0")
+        );
+    }
+
+    #[test]
+    fn sampling_client_rejects_invalid_configured_user_agent() {
+        let mut config = minimal_config();
+        config
+            .extra_headers
+            .insert("User-Agent".to_string(), "invalid\nvalue".to_string());
+
+        assert!(matches!(
+            SamplingClient::new(config),
+            Err(SamplingError::InvalidConfiguration(
+                "Invalid extra header value"
+            ))
+        ));
+    }
+
+    #[test]
+    fn responses_instructions_setting_reaches_conversation_request() {
+        let mut config = minimal_config();
+        config.responses_system_prompt_as_instructions = true;
+        let client = SamplingClient::new(config).expect("build");
+        let mut request = ConversationRequest::from_items(vec![
+            xai_grok_sampling_types::ConversationItem::system("system"),
+            xai_grok_sampling_types::ConversationItem::user("hello"),
+        ]);
+
+        client
+            .apply_conversation_defaults(&mut request)
+            .expect("apply defaults");
+        let response: rs::CreateResponse = (&request).into();
+
+        assert_eq!(response.instructions.as_deref(), Some("system"));
+        let rs::InputParam::Items(items) = response.input else {
+            panic!("Expected Items input");
+        };
+        assert_eq!(items.len(), 1);
+    }
+
     // Regression: a past change dropped HeaderInjector (traceparent) from sampling requests.
     #[test]
     fn header_injector_is_called_in_post() {
@@ -2792,6 +2954,7 @@ mod tests {
             api_backend: ApiBackend::Messages,
             auth_scheme: AuthScheme::Bearer,
             bearer_resolver: Some(std::sync::Arc::new(StaticBearerResolver("fresh-bearer"))),
+            auth_refresh_available: false,
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
@@ -2815,6 +2978,7 @@ mod tests {
             api_backend: ApiBackend::Responses,
             auth_scheme: AuthScheme::Bearer,
             bearer_resolver: Some(std::sync::Arc::new(StaticBearerResolver("fresh-bearer"))),
+            auth_refresh_available: false,
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
@@ -2841,6 +3005,7 @@ mod tests {
             api_backend: ApiBackend::Messages,
             auth_scheme: AuthScheme::XApiKey,
             bearer_resolver: Some(std::sync::Arc::new(StaticBearerResolver("fresh-anthropic"))),
+            auth_refresh_available: false,
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
@@ -2864,6 +3029,7 @@ mod tests {
             api_backend: ApiBackend::ChatCompletions,
             attribution_callback: Some(cb_dyn),
             bearer_resolver: None,
+            auth_refresh_available: false,
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
@@ -2901,6 +3067,7 @@ mod tests {
             api_key: Some("stale-seed-token".to_string()),
             api_backend: ApiBackend::Responses,
             bearer_resolver: Some(std::sync::Arc::new(EmptyResolver)),
+            auth_refresh_available: false,
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
@@ -2927,6 +3094,7 @@ mod tests {
             api_key: Some("stale-token".to_string()),
             api_backend: ApiBackend::Responses,
             bearer_resolver: Some(std::sync::Arc::new(EmptyResolver)),
+            auth_refresh_available: false,
             ..minimal_config()
         };
         let client = SamplingClient::new(cfg).expect("client should build");
@@ -2942,9 +3110,77 @@ mod tests {
         );
     }
 
-    /// `response.completed` carrying `usage.context_details.{input_tokens, output_tokens}` rewrites `usage.total_tokens` in place.
-    /// The new value is the live context length (`ctx.input + ctx.output`).
-    /// Billing fields stay on the wire's cumulative values.
+    /// Regression test: when a bearer_resolver is wired, `post()` must
+    /// *replace* the Authorization header from `default_headers`, not
+    /// append a second one. Duplicate Authorization headers cause
+    /// Cloudflare to return 400 Bad Request.
+    #[test]
+    fn bearer_resolver_replaces_authorization_header() {
+        #[derive(Debug)]
+        struct StaticResolver(String);
+        impl crate::config::BearerResolver for StaticResolver {
+            fn current_bearer(&self) -> Option<String> {
+                Some(self.0.clone())
+            }
+        }
+
+        let resolver: crate::config::SharedBearerResolver =
+            std::sync::Arc::new(StaticResolver("fresh-token".to_string()));
+        let cfg = SamplerConfig {
+            api_key: Some("stale-token".to_string()),
+            api_backend: ApiBackend::Responses,
+            bearer_resolver: Some(resolver),
+            auth_refresh_available: false,
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+
+        // Build a request to inspect the final headers.
+        let SentRequest { builder, .. } = client.post("https://example.test/v1/responses");
+        let request = builder.body("").build().expect("request should build");
+
+        let auth_values: Vec<_> = request.headers().get_all(AUTHORIZATION).iter().collect();
+        assert_eq!(
+            auth_values.len(),
+            1,
+            "expected exactly one Authorization header, got {}: {:?}",
+            auth_values.len(),
+            auth_values
+        );
+        assert_eq!(
+            auth_values[0].to_str().unwrap(),
+            "Bearer fresh-token",
+            "Authorization header should contain the resolver's fresh token"
+        );
+    }
+
+    /// `record_401_attribution` is a no-op when `attribution_callback`
+    /// is `None` (the BYOK / sampler-only path). The previous tests
+    /// in this module construct clients without a callback and rely
+    /// on this property holding.
+    #[test]
+    fn record_401_attribution_is_noop_without_callback() {
+        let cfg = SamplerConfig {
+            api_key: Some("bearer".to_string()),
+            api_backend: ApiBackend::ChatCompletions,
+            attribution_callback: None,
+            bearer_resolver: None,
+            auth_refresh_available: false,
+            ..minimal_config()
+        };
+        let client = SamplingClient::new(cfg).expect("client should build");
+        // Must not panic.
+        client.record_401_attribution(
+            crate::attribution::SamplingConsumer::ChatCompletions,
+            Some("bearer-tail-12"),
+        );
+    }
+
+    /// `response.completed` carrying
+    /// `usage.context_details.{input_tokens, output_tokens}` rewrites
+    /// `usage.total_tokens` in place to the live context length
+    /// (`ctx.input + ctx.output`). Billing fields stay on the wire's
+    /// cumulative values.
     #[test]
     fn deserialize_response_event_overrides_total_tokens_from_context_details() {
         let sse = r#"{
@@ -2970,7 +3206,9 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = deserialize_response_event(sse)
+            .expect("parse")
+            .expect("typed event");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3007,7 +3245,9 @@ mod tests {
             )
         };
 
-        let event = deserialize_response_event(&make(78)).expect("parse");
+        let event = deserialize_response_event(&make(78))
+            .expect("parse")
+            .expect("typed event");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3021,7 +3261,9 @@ mod tests {
         );
 
         // The REST mapper backfills 0 for unbilled requests: no stash.
-        let event = deserialize_response_event(&make(0)).expect("parse");
+        let event = deserialize_response_event(&make(0))
+            .expect("parse")
+            .expect("typed event");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3051,7 +3293,9 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = deserialize_response_event(sse)
+            .expect("parse")
+            .expect("typed event");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3085,7 +3329,9 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = deserialize_response_event(sse)
+            .expect("parse")
+            .expect("typed event");
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3105,10 +3351,32 @@ mod tests {
             "delta": "hello",
             "logprobs": []
         }"#;
-        let event = deserialize_response_event(sse).expect("non-terminal event parses");
+        let event = deserialize_response_event(sse)
+            .expect("non-terminal event parses")
+            .expect("typed event");
         assert!(matches!(
             event,
             rs::ResponseStreamEvent::ResponseOutputTextDelta(_)
         ));
+    }
+
+    #[test]
+    fn deserialize_response_event_ignores_response_metadata_extension() {
+        let sse = r#"{
+            "type": "response.metadata",
+            "sequence_number": 1,
+            "metadata": {"provider": "third-party"}
+        }"#;
+
+        let event = deserialize_response_event(sse).expect("metadata extension should be accepted");
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn deserialize_response_event_rejects_other_unknown_events() {
+        let sse = r#"{"type":"response.future_content","delta":"must not be hidden"}"#;
+
+        let err = deserialize_response_event(sse).expect_err("unknown content event must fail");
+        assert!(matches!(err, SamplingError::Serialization(_)));
     }
 }
