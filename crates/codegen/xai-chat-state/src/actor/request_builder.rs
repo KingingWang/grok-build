@@ -112,6 +112,11 @@ impl ChatStateActor {
             // Default: callers that can use partial output opt into
             // `CompletePartial`.
             length_policy: xai_grok_sampling_types::LengthPolicy::Fail,
+            responses_system_prompt_as_instructions: self
+                .state
+                .sampling_config
+                .responses_system_prompt_as_instructions
+                .unwrap_or(false),
         }
     }
 }

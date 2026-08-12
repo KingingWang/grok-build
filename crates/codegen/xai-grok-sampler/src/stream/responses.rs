@@ -252,6 +252,7 @@ pub(crate) fn stream_responses_tracked<'a>(
         let mut chunk_index: u64 = 0;
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
+        let mut text_acc = String::new();
         let mut reasoning_acc = String::new();
         let mut last_content_chunk_at = Instant::now();
 
@@ -341,6 +342,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                         chunk_timestamps.push(Instant::now());
                         chunk_index += 1;
                         message_chunk_count += 1;
+                        text_acc.push_str(&delta);
                         yield SamplingEvent::ChannelToken {
                             request_id: request_id.clone(),
                             channel: SamplingChannel::Text,
@@ -662,6 +664,18 @@ pub(crate) fn stream_responses_tracked<'a>(
         // `summary` (the streaming deltas may have arrived out of band).
         // Splice policy lives in `inject_streaming_reasoning_fallback`.
         let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
+        if status == Status::Completed
+            && !text_acc.is_empty()
+            && let Some(ConversationItem::Assistant(assistant)) = items.last_mut()
+            && assistant.content.is_empty()
+        {
+            tracing::debug!(
+                target: crate::sampling_log::TARGET,
+                request_id = %request_id,
+                "reconstructing empty terminal Responses output from streamed text deltas"
+            );
+            assistant.content = Arc::<str>::from(text_acc);
+        }
         xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
 
         let has_tool_calls = items.iter().any(|i| match i {
@@ -821,6 +835,35 @@ mod tests {
     fn completed_event() -> rs::ResponseStreamEvent {
         rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
             response: empty_completed_response(),
+            sequence_number: 0,
+        })
+    }
+
+    fn completed_event_with_text(text: &str) -> rs::ResponseStreamEvent {
+        let mut response = empty_completed_response();
+        response
+            .output
+            .push(rs_types::OutputItem::Message(rs_types::OutputMessage {
+                content: vec![rs_types::OutputMessageContent::OutputText(
+                    rs_types::OutputTextContent {
+                        annotations: vec![],
+                        logprobs: None,
+                        text: text.into(),
+                    },
+                )],
+                id: "item-1".into(),
+                role: rs_types::AssistantRole::Assistant,
+                status: rs_types::OutputStatus::Completed,
+            }));
+        rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+            response,
+            sequence_number: 0,
+        })
+    }
+
+    fn incomplete_event() -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseIncomplete(rs_types::ResponseIncompleteEvent {
+            response: build_response(rs_types::Status::Incomplete),
             sequence_number: 0,
         })
     }
@@ -1035,8 +1078,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_delta_then_completed_yields_completed_with_stop() {
-        let raw = stream::iter(vec![Ok(text_delta_event("hello")), Ok(completed_event())]).boxed();
+    async fn text_deltas_then_empty_completed_reconstructs_assistant_text() {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("你好，")),
+            Ok(text_delta_event("world")),
+            Ok(completed_event()),
+        ])
+        .boxed();
         let events = collect(stream_responses(
             raw,
             None,
@@ -1057,11 +1105,61 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text_tokens, vec!["hello"]);
+        assert_eq!(text_tokens, vec!["你好，", "world"]);
 
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
+                assert_eq!(response.assistant_text(), "你好，world");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_text_takes_precedence_over_streaming_deltas() {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("streamed")),
+            Ok(completed_event_with_text("terminal")),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.assistant_text(), "terminal");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_does_not_reconstruct_assistant_text() {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("partial")),
+            Ok(incomplete_event()),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.stop_reason, Some(StopReason::Length));
+                assert!(response.assistant_text().is_empty());
             }
             other => panic!("expected Completed, got {other:?}"),
         }

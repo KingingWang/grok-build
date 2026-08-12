@@ -1084,6 +1084,9 @@ pub struct ModelsConfig {
     /// `[model.<id>].extra_headers` entry overrides per key (case-insensitive).
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub extra_headers: IndexMap<String, String>,
+    /// Global default HTTP User-Agent. A per-model `user_agent` overrides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
     /// Global default values applied to every model that leaves the field
     /// unset; a per-model `[model.<id>]` value always wins. A deliberately
     /// small, allow-listed subset of the per-model fields (only `Option` ones,
@@ -1104,6 +1107,14 @@ pub struct ModelsConfig {
     pub subagent_rate_limit_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Global default for whether to use streaming HTTP requests. Per-model
+    /// `[model.<id>].stream` overrides. Unset keeps streaming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// Global default for lifting Responses system messages into the
+    /// top-level `instructions` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responses_system_prompt_as_instructions: Option<bool>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -3736,6 +3747,21 @@ fn apply_global_scalar_defaults(
         if let Some(v) = models.stream_tool_calls {
             info.stream_tool_calls.get_or_insert(v);
         }
+        if let Some(v) = models.stream {
+            info.stream.get_or_insert(v);
+        }
+        if let Some(ref v) = models.user_agent
+            && !info
+                .extra_headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("user-agent"))
+        {
+            info.user_agent.get_or_insert_with(|| v.clone());
+        }
+        if let Some(v) = models.responses_system_prompt_as_instructions {
+            info.responses_system_prompt_as_instructions
+                .get_or_insert(v);
+        }
     }
 }
 /// Built-in default models. Prefer `resolve_model_list()`.
@@ -3856,6 +3882,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 api_key: None,
                 env_key: None,
                 extra_headers: IndexMap::new(),
+                user_agent: None,
                 use_concise: false,
                 hidden: m.hidden,
                 supported_in_api: m.supported_in_api,
@@ -3867,6 +3894,8 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 compaction_at_tokens: m.compaction_at_tokens,
                 show_model_fingerprint: m.show_model_fingerprint,
                 stream_tool_calls: None,
+                stream: None,
+                responses_system_prompt_as_instructions: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3925,6 +3954,9 @@ pub struct ModelEntryConfig {
     /// Example: { "x-anthropic-api-key" = "sk-ant-..." }
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub extra_headers: IndexMap<String, String>,
+    /// HTTP User-Agent sent to this model's endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
     /// The total context window size in tokens for this model.
     /// Used for auto-compact threshold calculations.
     /// Required — BYOK users must explicitly set this in config.toml.
@@ -3992,6 +4024,14 @@ pub struct ModelEntryConfig {
     /// flag should leave this unset to avoid request errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Whether to use a streaming HTTP request for this model. When `false`,
+    /// the sampler issues a single non-streaming request. Unset (the default)
+    /// keeps streaming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// Send Responses system messages through top-level `instructions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_system_prompt_as_instructions: Option<bool>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to
     /// the all-disabled state via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "is_default_laziness_detector")]
@@ -4035,6 +4075,7 @@ pub struct ConfigModelOverride {
     pub api_backend: Option<ApiBackend>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
+    pub user_agent: Option<String>,
     #[serde(default)]
     pub query_params: IndexMap<String, String>,
     #[serde(default)]
@@ -4065,6 +4106,8 @@ pub struct ConfigModelOverride {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: Option<bool>,
     pub stream_tool_calls: Option<bool>,
+    pub stream: Option<bool>,
+    pub responses_system_prompt_as_instructions: Option<bool>,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -4106,6 +4149,9 @@ impl ConfigModelOverride {
         }
         if !self.extra_headers.is_empty() {
             entry.info.extra_headers = self.extra_headers.clone();
+        }
+        if self.user_agent.is_some() {
+            entry.info.user_agent.clone_from(&self.user_agent);
         }
         if !self.query_params.is_empty() {
             entry.info.query_params = self.query_params.clone();
@@ -4165,6 +4211,13 @@ impl ConfigModelOverride {
         if self.stream_tool_calls.is_some() {
             entry.info.stream_tool_calls = self.stream_tool_calls;
         }
+        if self.stream.is_some() {
+            entry.info.stream = self.stream;
+        }
+        if self.responses_system_prompt_as_instructions.is_some() {
+            entry.info.responses_system_prompt_as_instructions =
+                self.responses_system_prompt_as_instructions;
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -4211,6 +4264,7 @@ pub struct ModelInfo {
     pub api_backend: ApiBackend,
     pub auth_scheme: AuthScheme,
     pub extra_headers: IndexMap<String, String>,
+    pub user_agent: Option<String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub query_params: IndexMap<String, String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -4257,6 +4311,12 @@ pub struct ModelInfo {
     pub show_model_fingerprint: bool,
     /// When `Some(true)`, the sampler injects `stream_tool_calls: true`
     pub stream_tool_calls: Option<bool>,
+    /// Whether to use a streaming HTTP request for this model. `Some(true)`
+    /// (the default when unset) uses the streaming API; `Some(false)` issues
+    /// a single non-streaming request and surfaces the full response at once.
+    pub stream: Option<bool>,
+    /// When true, Responses system messages use top-level `instructions`.
+    pub responses_system_prompt_as_instructions: Option<bool>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to
     /// the all-disabled state — the feature is per-model opt-in with a
     /// second-step `max_nudges_per_session > 0` opt-in for actually
@@ -4282,6 +4342,7 @@ impl ModelInfo {
             api_backend: ApiBackend::default(),
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
+            user_agent: None,
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -4302,6 +4363,8 @@ impl ModelInfo {
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            stream: None,
+            responses_system_prompt_as_instructions: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -4321,6 +4384,7 @@ impl ModelInfo {
             api_backend: entry.api_backend.clone(),
             auth_scheme: entry.auth_scheme.unwrap_or_default(),
             extra_headers: entry.extra_headers.clone(),
+            user_agent: entry.user_agent.clone(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: entry.context_window,
@@ -4341,6 +4405,8 @@ impl ModelInfo {
             compaction_at_tokens: entry.compaction_at_tokens,
             show_model_fingerprint: entry.show_model_fingerprint,
             stream_tool_calls: entry.stream_tool_calls,
+            stream: entry.stream,
+            responses_system_prompt_as_instructions: entry.responses_system_prompt_as_instructions,
             laziness_detector: entry.laziness_detector.clone(),
         }
     }
@@ -5090,6 +5156,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 api_backend: ApiBackend::Responses,
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
+                user_agent: None,
                 query_params: IndexMap::new(),
                 env_http_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(200_000).unwrap(),
@@ -5110,6 +5177,8 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 compaction_at_tokens: None,
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
+                stream: None,
+                responses_system_prompt_as_instructions: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             api_key: Some(bearer),
@@ -5229,6 +5298,10 @@ pub(crate) fn sampling_config_for_model(
     let temperature = info.temperature;
     let top_p = info.top_p;
     let mut extra_headers = info.extra_headers.clone();
+    if let Some(user_agent) = info.user_agent.as_ref() {
+        extra_headers.retain(|key, _| !key.eq_ignore_ascii_case("user-agent"));
+        extra_headers.insert("user-agent".to_string(), user_agent.clone());
+    }
     inject_url_derived_headers(
         &mut extra_headers,
         alpha_test_key.as_deref(),
@@ -5259,13 +5332,19 @@ pub(crate) fn sampling_config_for_model(
         force_http1: false,
         max_retries: info.max_retries,
         stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
+        stream: info.stream.unwrap_or(true),
+        responses_system_prompt_as_instructions: info
+            .responses_system_prompt_as_instructions
+            .unwrap_or(false),
         idle_timeout_secs: None,
+        request_timeout_secs: None,
         client_identifier: None,
         deployment_id,
         user_id,
         origin_client: None,
         attribution_callback: None,
         bearer_resolver: None,
+        auth_refresh_available: false,
         supports_backend_search: info.supports_backend_search,
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
@@ -5327,6 +5406,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             api_backend: ApiBackend::Responses,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
+            user_agent: None,
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -5348,6 +5428,8 @@ fn resolve_hidden_default_web_search_sampling_config(
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            stream: None,
+            responses_system_prompt_as_instructions: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         api_key: None,

@@ -9,7 +9,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -18,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use xai_grok_sampling_types::{
-    ApiErrorCode, ConversationRequest, ConversationResponse, EmptyResponseContext, SamplingError,
-    SentCredential, error::Result as SamplingResult,
+    ApiErrorCode, AssistantItem, ConversationItem, ConversationRequest, ConversationResponse,
+    EmptyResponseContext, SamplingError, SentCredential, StopReason, TokenUsage, ToolCall,
+    error::Result as SamplingResult, messages, reported_cost_ticks, rs, synthesized_reasoning_item,
 };
 
 use crate::client::{ApiBackend, SamplingClient};
@@ -104,6 +105,15 @@ pub(crate) async fn run_request_task(
         resolve_max_retries(configured_max_retries)
     };
 
+    // `0` means unset — fall back to the default. The threshold no longer
+    // caps 429 retries; only `RATE_LIMIT_RETRY_DISABLED` is honored (see
+    // `classify_error`).
+    let rate_limit_threshold = if retry_policy.rate_limit_retry_threshold == 0 {
+        retry_mod::RATE_LIMIT_RETRY_THRESHOLD
+    } else {
+        retry_policy.rate_limit_retry_threshold
+    };
+
     // Build the initial client. Configuration errors here are fatal
     // (no point retrying with the same broken config).
     let mut client = match SamplingClient::new(config.clone()) {
@@ -135,6 +145,13 @@ pub(crate) async fn run_request_task(
     let mut doom_retry_count: u32 = 0;
     let output_observed = Arc::new(AtomicBool::new(false));
 
+    // Wall-clock start of the retry loop. The total time budget
+    // (`retry_policy.max_retry_duration_secs`, default 10 min) caps how
+    // long the loop keeps retrying before surfacing the last error as
+    // Fatal — independent of the count-based `max_retries` safety net.
+    let retry_started_at = Instant::now();
+    let max_retry_duration = Duration::from_secs(retry_policy.max_retry_duration_secs);
+
     loop {
         if cancel_token.is_cancelled() {
             handle_cancellation(&event_tx, &request_id, &mut completion_tx);
@@ -153,6 +170,7 @@ pub(crate) async fn run_request_task(
             &cancel_token,
             doom_check,
             Arc::clone(&output_observed),
+            config.stream,
         )
         .instrument(sampling_span.clone())
         .await;
@@ -215,11 +233,21 @@ pub(crate) async fn run_request_task(
                     reason = context.reason,
                 );
                 let err = SamplingError::EmptyResponse { context };
+                if time_budget_exhausted(
+                    retry_started_at,
+                    max_retry_duration,
+                    &err,
+                    &event_tx,
+                    &request_id,
+                    &mut completion_tx,
+                ) {
+                    return request_id;
+                }
                 if !apply_retry_decision(
                     &err,
                     &mut retry_count,
                     effective_max_retries,
-                    &retry_policy,
+                    rate_limit_threshold,
                     &event_tx,
                     &request_id,
                     &mut request,
@@ -276,11 +304,21 @@ pub(crate) async fn run_request_task(
                     handle_cancellation(&event_tx, &request_id, &mut completion_tx);
                     return request_id;
                 }
+                if time_budget_exhausted(
+                    retry_started_at,
+                    max_retry_duration,
+                    &error,
+                    &event_tx,
+                    &request_id,
+                    &mut completion_tx,
+                ) {
+                    return request_id;
+                }
                 if !apply_retry_decision(
                     &error,
                     &mut retry_count,
                     effective_max_retries,
-                    &retry_policy,
+                    rate_limit_threshold,
                     &event_tx,
                     &request_id,
                     &mut request,
@@ -299,11 +337,21 @@ pub(crate) async fn run_request_task(
                 return request_id;
             }
             AttemptOutcome::InitFailed { error } => {
+                if time_budget_exhausted(
+                    retry_started_at,
+                    max_retry_duration,
+                    &error,
+                    &event_tx,
+                    &request_id,
+                    &mut completion_tx,
+                ) {
+                    return request_id;
+                }
                 if !apply_retry_decision(
                     &error,
                     &mut retry_count,
                     effective_max_retries,
-                    &retry_policy,
+                    rate_limit_threshold,
                     &event_tx,
                     &request_id,
                     &mut request,
@@ -331,7 +379,7 @@ async fn apply_retry_decision(
     err: &SamplingError,
     retry_count: &mut u32,
     max_retries: u32,
-    retry_policy: &RetryPolicy,
+    rate_limit_threshold: u32,
     event_tx: &mpsc::UnboundedSender<SamplingEvent>,
     request_id: &RequestId,
     request: &mut ConversationRequest,
@@ -340,11 +388,27 @@ async fn apply_retry_decision(
     cancel_token: &CancellationToken,
     completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
 ) -> bool {
-    let rate_limit_threshold = if retry_policy.rate_limit_retry_threshold == 0 {
-        retry_mod::RATE_LIMIT_RETRY_THRESHOLD
-    } else {
-        retry_policy.rate_limit_retry_threshold
-    };
+    // Server 401 interception: when the session can reactively refresh
+    // credentials (`auth_refresh_available` — OAuth session refresh,
+    // auth_provider re-mint, or devbox), emit the first 401 of this
+    // request to the session so it can refresh once and resubmit. When
+    // no refresh mechanism exists (static BYOK / api-key auth), fall
+    // through to `classify_error`'s generic retry-with-backoff arm so
+    // the 401 retries in-loop within the time budget like every other
+    // HTTP error code. `SamplingError::Auth` (client-side bearer
+    // construction failure) is handled by `classify_error` (EmitToSession)
+    // regardless of this flag.
+    //
+    // Only the first 401 per request task is emitted for refresh; a 401
+    // that recurs after the session's refresh+resubmit (a fresh task,
+    // retry_count == 0) is emitted again, bounded by the session's
+    // `AuthRetrySchedule`.
+    if err.is_auth_error() && config.auth_refresh_available && *retry_count == 0 {
+        emit_failed(event_tx, request_id, err);
+        send_completion(completion_tx, Err(clone_error(err)));
+        return false;
+    }
+
     let decision = classify_error(err, *retry_count, max_retries, rate_limit_threshold);
 
     // Connection-reset / broken-pipe on body upload often means nginx
@@ -474,18 +538,14 @@ async fn apply_retry_decision(
             false
         }
         RetryDecision::Fatal(fatal_err) => {
-            // Emit only on true budget exhaustion (hit the retry / rate-limit
-            // cap), mirroring `classify_error`'s Fatal conditions — NOT on a
-            // server `x-should-retry: false` or a non-retryable error, which
-            // are also Fatal but are not "exhausted".
+            // Distinguish true budget exhaustion (count cap hit on a
+            // retryable error) from an immediately-fatal error
+            // (non-retryable variant, or a zero retry budget). The
+            // time-budget cap is enforced earlier in the loop
+            // (`time_budget_exhausted`); here only the count cap or a
+            // non-retryable variant reaches Fatal.
             let next_attempt = *retry_count + 1;
-            let server_said_stop = matches!(err.should_retry_header(), Some(false));
-            let budget_exhausted = !server_said_stop
-                && if err.is_rate_limited() {
-                    next_attempt >= max_retries.min(rate_limit_threshold)
-                } else {
-                    err.is_retryable() && next_attempt >= max_retries
-                };
+            let budget_exhausted = err.is_retryable() && next_attempt >= max_retries;
             if budget_exhausted {
                 let exhausted_span = tracing::info_span!(
                     "http.retries_exhausted",
@@ -519,6 +579,36 @@ async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -
     }
 }
 
+/// Check whether the retry time budget is exhausted.
+///
+/// When the elapsed time since `retry_started_at` has passed
+/// `max_retry_duration`, surface `err` as a terminal failure (emit
+/// `Failed` + send the completion result) and return `true` so the caller
+/// stops the retry loop. Returns `false` (no side-effects) when there is
+/// budget remaining.
+fn time_budget_exhausted(
+    retry_started_at: Instant,
+    max_retry_duration: Duration,
+    err: &SamplingError,
+    event_tx: &mpsc::UnboundedSender<SamplingEvent>,
+    request_id: &RequestId,
+    completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
+) -> bool {
+    if retry_started_at.elapsed() < max_retry_duration {
+        return false;
+    }
+    tracing::warn!(
+        target: crate::sampling_log::TARGET,
+        elapsed_secs = retry_started_at.elapsed().as_secs(),
+        budget_secs = max_retry_duration.as_secs(),
+        error = %err,
+        "retry time budget exhausted; surfacing last error as fatal"
+    );
+    emit_failed(event_tx, request_id, err);
+    send_completion(completion_tx, Err(clone_error(err)));
+    true
+}
+
 /// Run a single attempt: build the raw stream, drive it through the
 /// matching L2 transform, and forward all non-terminal events to
 /// `event_tx`. Captures the rich `SamplingError` from the underlying
@@ -537,8 +627,22 @@ async fn run_one_attempt(
     cancel_token: &CancellationToken,
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
     output_observed: Arc<AtomicBool>,
+    stream: bool,
 ) -> AttemptOutcome {
     let length_policy = request.length_policy;
+    if !stream {
+        return run_one_attempt_non_stream(
+            client,
+            request,
+            request_id,
+            idle_timeout,
+            event_tx,
+            cancel_token,
+            doom_check,
+            Arc::clone(&output_observed),
+        )
+        .await;
+    }
     match client.api_backend() {
         ApiBackend::ChatCompletions => {
             let (raw, metadata) = match client.conversation_stream(request).await {
@@ -621,6 +725,345 @@ async fn run_one_attempt(
             )
             .await
         }
+    }
+}
+
+/// Non-streaming variant of [`run_one_attempt`]: issues a single HTTP
+/// request without `stream: true` and surfaces the full response at once.
+///
+/// The Responses backend reuses the streaming L2 transform by feeding it a
+/// synthetic `ResponseCompleted` event built from the non-streaming
+/// `rs::Response`, so `ConversationResponse` construction (usage, cost,
+/// items, stop_reason) stays identical to the streaming path. The Chat
+/// Completions and Messages backends build the [`ConversationResponse`]
+/// directly and emit a minimal `FirstToken` + `Completed` event pair
+/// through [`drive_l2`], so the retry loop's output-observed / truncation /
+/// empty-detection logic still runs.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_attempt_non_stream(
+    client: &SamplingClient,
+    request: ConversationRequest,
+    request_id: RequestId,
+    idle_timeout: Duration,
+    event_tx: &mpsc::UnboundedSender<SamplingEvent>,
+    cancel_token: &CancellationToken,
+    doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    output_observed: Arc<AtomicBool>,
+) -> AttemptOutcome {
+    use futures_util::stream;
+
+    let backend = client.api_backend();
+    let stream_start = Instant::now();
+    let empty_captured: ErrorCell = Arc::new(Mutex::new(None));
+
+    match backend {
+        ApiBackend::Responses => {
+            let response = match client.conversation_responses(request).await {
+                Ok(r) => r,
+                Err(e) => return AttemptOutcome::InitFailed { error: e },
+            };
+            // Build a synthetic ResponseCompleted event and reuse the
+            // streaming L2 transform so the resulting ConversationResponse
+            // (usage, cost, items, stop_reason) is constructed identically.
+            // The single-event synthetic stream is immediately ready, so the
+            // idle timeout never fires.
+            let completed =
+                rs::ResponseStreamEvent::ResponseCompleted(rs::ResponseCompletedEvent {
+                    response,
+                    sequence_number: 0,
+                });
+            let raw: BoxStream<'static, SamplingResult<rs::ResponseStreamEvent>> =
+                stream::iter(vec![Ok(completed)]).boxed();
+            // Mirror the streaming Responses arm: an armed doom check gets
+            // a capture buffer so a doomed attempt can replay its failed
+            // turn; every other attempt holds the default (no buffering).
+            let failed_response = if doom_check.is_some() {
+                FailedResponseCapture::armed()
+            } else {
+                FailedResponseCapture::default()
+            };
+            let l2 = stream_responses_tracked(
+                raw,
+                None,
+                request_id.clone(),
+                idle_timeout,
+                None,
+                Arc::clone(&output_observed),
+                failed_response.clone(),
+            );
+            drive_l2(
+                l2,
+                request_id,
+                event_tx,
+                cancel_token,
+                Arc::clone(&empty_captured),
+                doom_check,
+                failed_response,
+                output_observed,
+            )
+            .await
+        }
+        ApiBackend::ChatCompletions => {
+            let resp = match client.conversation(request).await {
+                Ok(r) => r,
+                Err(e) => return AttemptOutcome::InitFailed { error: e },
+            };
+            let has_output = chat_response_has_output(&resp);
+            let response = conversation_response_from_chat(&resp);
+            let metrics = InferenceLatencyStats::from_timestamps(stream_start, &[], Instant::now());
+            let events =
+                build_terminal_event_stream(request_id.clone(), response, metrics, has_output);
+            drive_l2(
+                events,
+                request_id,
+                event_tx,
+                cancel_token,
+                Arc::clone(&empty_captured),
+                doom_check,
+                FailedResponseCapture::default(),
+                output_observed,
+            )
+            .await
+        }
+        ApiBackend::Messages => {
+            let resp = match client.conversation_messages(request).await {
+                Ok(r) => r,
+                Err(e) => return AttemptOutcome::InitFailed { error: e },
+            };
+            let has_output = messages_response_has_output(&resp);
+            let response = conversation_response_from_messages(resp);
+            let metrics = InferenceLatencyStats::from_timestamps(stream_start, &[], Instant::now());
+            let events =
+                build_terminal_event_stream(request_id.clone(), response, metrics, has_output);
+            drive_l2(
+                events,
+                request_id,
+                event_tx,
+                cancel_token,
+                Arc::clone(&empty_captured),
+                doom_check,
+                FailedResponseCapture::default(),
+                output_observed,
+            )
+            .await
+        }
+    }
+}
+
+/// Build a minimal two-event L2 stream for non-streaming backends: a
+/// `FirstToken` (only when real output was produced, mirroring the streaming
+/// path which emits FirstToken on the first content/tool delta) followed by
+/// the terminal `Completed`. [`drive_l2`] applies its normal truncation /
+/// empty-detection logic to the `Completed` event.
+fn build_terminal_event_stream(
+    request_id: RequestId,
+    response: ConversationResponse,
+    metrics: InferenceLatencyStats,
+    has_output: bool,
+) -> impl futures_util::Stream<Item = SamplingEvent> {
+    let mut events: Vec<SamplingEvent> = Vec::with_capacity(2);
+    if has_output {
+        events.push(SamplingEvent::FirstToken {
+            request_id: request_id.clone(),
+        });
+    }
+    events.push(SamplingEvent::Completed {
+        request_id,
+        response: Box::new(response),
+        metrics,
+    });
+    futures_util::stream::iter(events)
+}
+
+/// Build a [`ConversationResponse`] from a non-streaming Chat Completions
+/// response, mirroring the streaming L2 transform's final construction.
+fn conversation_response_from_chat(
+    resp: &xai_grok_sampling_types::ChatCompletionResponse,
+) -> ConversationResponse {
+    use std::sync::Arc;
+
+    let model = resp.model.clone();
+    let (content, reasoning, tool_calls, finish_reason) = resp
+        .choices
+        .first()
+        .map(|c| {
+            let m = &c.message;
+            let content = m.content.clone().unwrap_or_default();
+            let reasoning = m.reasoning_content.clone().filter(|s| !s.is_empty());
+            let tool_calls: Vec<ToolCall> = m
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCall {
+                    id: Arc::<str>::from(tc.id.as_str()),
+                    name: tc.function.name.clone(),
+                    arguments: Arc::<str>::from(tc.function.arguments.as_str()),
+                })
+                .collect();
+            let finish = c.finish_reason.map(StopReason::from);
+            (content, reasoning, tool_calls, finish)
+        })
+        .unwrap_or_default();
+
+    // Honor tool calls by overriding the stop reason if the model forgot.
+    let stop_reason = if !tool_calls.is_empty() {
+        Some(StopReason::ToolCalls)
+    } else {
+        finish_reason
+    };
+
+    let usage = resp.usage.clone().map(TokenUsage::from);
+    let cost_usd_ticks = resp
+        .usage
+        .as_ref()
+        .and_then(|u| reported_cost_ticks(u.cost_in_usd_ticks));
+
+    let mut items: Vec<ConversationItem> = Vec::new();
+    if let Some(r) = reasoning {
+        items.push(ConversationItem::Reasoning(synthesized_reasoning_item(r)));
+    }
+    items.push(ConversationItem::Assistant(AssistantItem {
+        content: Arc::<str>::from(content),
+        tool_calls,
+        model_id: Some(model),
+        model_fingerprint: None,
+        reasoning_effort: None,
+    }));
+
+    ConversationResponse {
+        items,
+        stop_reason,
+        usage,
+        cost_usd_ticks,
+        message_chunks_emitted: 0,
+        doom_loop_signals: Vec::new(),
+        stop_message: None,
+        message_id: None,
+        raw_stop_reason: None,
+        stop_sequence: None,
+    }
+}
+
+/// Whether a non-streaming Chat Completions response produced real output
+/// (text or tool calls), mirroring the streaming FirstToken gate.
+fn chat_response_has_output(resp: &xai_grok_sampling_types::ChatCompletionResponse) -> bool {
+    resp.choices.first().is_some_and(|c| {
+        let m = &c.message;
+        m.content.as_deref().is_some_and(|s| !s.is_empty()) || !m.tool_calls.is_empty()
+    })
+}
+
+/// Build a [`ConversationResponse`] from a non-streaming Anthropic Messages
+/// response, mirroring the streaming L2 transform's final construction.
+fn conversation_response_from_messages(resp: messages::MessagesResponse) -> ConversationResponse {
+    use std::sync::Arc;
+    use xai_grok_sampling_types::messages::ContentBlock;
+
+    let model = resp.model.clone();
+    let resp_id = resp.id.clone();
+    let mut content = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut reasoning: Option<String> = None;
+
+    for block in resp.content {
+        match block {
+            ContentBlock::Text { text, .. } => {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&text);
+            }
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                tool_calls.push(ToolCall {
+                    id: Arc::<str>::from(id),
+                    name,
+                    arguments: Arc::<str>::from(serde_json::to_string(&input).unwrap_or_default()),
+                });
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                if !thinking.is_empty() {
+                    reasoning = Some(thinking);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let stop_reason = if !tool_calls.is_empty() {
+        Some(StopReason::ToolCalls)
+    } else {
+        resp.stop_reason.map(messages_stop_reason_to_conversation)
+    };
+
+    let usage = {
+        let u = resp.usage;
+        let total_prompt = u
+            .input_tokens
+            .saturating_add(u.cache_read_input_tokens)
+            .saturating_add(u.cache_creation_input_tokens);
+        if total_prompt > 0 || u.output_tokens > 0 {
+            Some(TokenUsage {
+                prompt_tokens: total_prompt,
+                completion_tokens: u.output_tokens,
+                total_tokens: total_prompt.saturating_add(u.output_tokens),
+                reasoning_tokens: 0,
+                cached_prompt_tokens: u.cache_read_input_tokens,
+                cache_creation_prompt_tokens: u.cache_creation_input_tokens,
+            })
+        } else {
+            None
+        }
+    };
+
+    let mut items: Vec<ConversationItem> = Vec::new();
+    if let Some(r) = reasoning {
+        items.push(ConversationItem::Reasoning(synthesized_reasoning_item(r)));
+    }
+    items.push(ConversationItem::Assistant(AssistantItem {
+        content: Arc::<str>::from(content),
+        tool_calls,
+        model_id: Some(model),
+        model_fingerprint: None,
+        reasoning_effort: None,
+    }));
+
+    ConversationResponse {
+        items,
+        stop_reason,
+        usage,
+        // Anthropic Messages API carries no cost on the wire.
+        cost_usd_ticks: None,
+        message_chunks_emitted: 0,
+        doom_loop_signals: Vec::new(),
+        stop_message: None,
+        message_id: Some(resp_id),
+        raw_stop_reason: None,
+        stop_sequence: None,
+    }
+}
+
+/// Whether a non-streaming Messages response produced real output.
+fn messages_response_has_output(resp: &messages::MessagesResponse) -> bool {
+    resp.content.iter().any(|block| match block {
+        messages::ContentBlock::Text { text, .. } => !text.is_empty(),
+        messages::ContentBlock::ToolUse { .. } => true,
+        _ => false,
+    })
+}
+
+/// Map an Anthropic Messages `StopReason` to the backend-neutral
+/// [`StopReason`], mirroring the streaming L2 transform.
+fn messages_stop_reason_to_conversation(sr: messages::StopReason) -> StopReason {
+    match sr {
+        messages::StopReason::EndTurn => StopReason::Stop,
+        messages::StopReason::MaxTokens => StopReason::Length,
+        messages::StopReason::StopSequence => StopReason::Stop,
+        messages::StopReason::ToolUse => StopReason::ToolCalls,
+        messages::StopReason::Refusal => StopReason::ContentFilter,
+        messages::StopReason::PauseTurn => StopReason::Stop,
+        messages::StopReason::ModelContextWindowExceeded => StopReason::Length,
+        messages::StopReason::Unknown(_) => StopReason::Stop,
     }
 }
 
@@ -1268,7 +1711,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (completion_tx, completion_rx) = oneshot::channel();
+        let (completion_tx, completion_rx) = oneshot::channel::<CompletionResult>();
         let mut completion_tx = Some(completion_tx);
         let mut retry_count = 0;
         let mut request = ConversationRequest::default();
@@ -1284,7 +1727,7 @@ mod tests {
             &error,
             &mut retry_count,
             2,
-            &RetryPolicy::default(),
+            crate::retry::RATE_LIMIT_RETRY_THRESHOLD,
             &event_tx,
             &RequestId::from("cancel-backoff"),
             &mut request,
