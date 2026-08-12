@@ -817,7 +817,12 @@ async fn read_parent_sampling_config(
                 force_http1: false,
                 max_retries: None,
                 stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
+                stream: true,
+                responses_system_prompt_as_instructions: cfg
+                    .responses_system_prompt_as_instructions
+                    .unwrap_or(false),
                 idle_timeout_secs: None,
+                request_timeout_secs: None,
                 client_identifier: ctx.sampling_config.client_identifier.clone(),
                 deployment_id: ctx.sampling_config.deployment_id.clone(),
                 user_id: ctx.sampling_config.user_id.clone(),
@@ -828,6 +833,7 @@ async fn read_parent_sampling_config(
                 } else {
                     inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url)
                 },
+                auth_refresh_available: false,
                 supports_backend_search,
                 compactions_remaining: ctx
                     .models_manager

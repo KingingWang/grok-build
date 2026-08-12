@@ -77,7 +77,22 @@ pub struct SamplerConfig {
     pub force_http1: bool,
     pub max_retries: Option<u32>,
     pub stream_tool_calls: bool,
+    /// Whether to use a streaming HTTP request for inference. When `false`,
+    /// the sampler issues a single non-streaming request and surfaces the
+    /// full response at once (no incremental token events). Default `true`
+    /// (streaming); set to `false` via the model config to disable streaming.
+    #[serde(default = "default_stream")]
+    pub stream: bool,
+    /// Whether Responses API system messages should be sent through the
+    /// top-level `instructions` field instead of `input` system messages.
+    #[serde(default)]
+    pub responses_system_prompt_as_instructions: bool,
     pub idle_timeout_secs: Option<u64>,
+    /// Overall request timeout in seconds. Covers the full request for
+    /// non-streaming (send + body) and the response-header wait for
+    /// streaming; the L2 idle timeout covers inter-chunk gaps separately.
+    /// `None` falls back to [`DEFAULT_REQUEST_TIMEOUT_SECS`] (300s).
+    pub request_timeout_secs: Option<u64>,
 
     // Reasoning effort
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -110,6 +125,19 @@ pub struct SamplerConfig {
     /// Live bearer resolve per request. `None` uses construction-time `api_key`.
     #[serde(skip)]
     pub bearer_resolver: Option<SharedBearerResolver>,
+
+    /// Whether the session can reactively refresh credentials on a 401
+    /// (OAuth session-token refresh, `auth_provider` re-mint, or devbox
+    /// re-mint). Set by the session when it builds the per-request config.
+    ///
+    /// When `true`, the sampler emits the first 401 of a request to the
+    /// session so it can refresh once. When `false` (static BYOK / api-key
+    /// auth with no refresh mechanism), a 401 is retried in-loop with
+    /// exponential backoff like every other HTTP error code, up to the
+    /// time budget. `SamplingError::Auth` (client-side construction
+    /// failure) is always emitted to the session regardless of this flag.
+    #[serde(skip)]
+    pub auth_refresh_available: bool,
 
     #[serde(default)]
     pub supports_backend_search: bool,
@@ -157,7 +185,10 @@ impl Default for SamplerConfig {
             force_http1: false,
             max_retries: None,
             stream_tool_calls: false,
+            stream: true,
+            responses_system_prompt_as_instructions: false,
             idle_timeout_secs: None,
+            request_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,
             client_identifier: None,
@@ -166,6 +197,7 @@ impl Default for SamplerConfig {
             client_version: None,
             attribution_callback: None,
             bearer_resolver: None,
+            auth_refresh_available: false,
             supports_backend_search: false,
             compactions_remaining: None,
             compaction_at_tokens: None,
@@ -192,13 +224,42 @@ pub type SharedHeaderInjector = std::sync::Arc<dyn HeaderInjector>;
 /// Retry knobs for the sampler's internal transport-error retry loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
-    /// Maximum number of retries before giving up.
+    /// Maximum number of retries before giving up. Acts as a safety net;
+    /// the primary cap is [`Self::max_retry_duration_secs`].
     pub max_retries: u32,
     /// After this many rate-limit (429) retries, escalate to the caller.
     /// Lower than `max_retries` because rate-limit waits can be long.
+    ///
+    /// Deprecated: 429 now retries within the same time budget as every
+    /// other HTTP code; this field is retained for serde/config
+    /// compatibility and no longer caps 429 retries.
     pub rate_limit_retry_threshold: u32,
     #[serde(default)]
     pub retry_only_before_output: bool,
+    /// Total time budget for the retry loop, in seconds. Once the elapsed
+    /// time since the first failure exceeds this, no further retries are
+    /// attempted and the last error becomes Fatal. Default 600 (10 min).
+    #[serde(default = "default_max_retry_duration_secs")]
+    pub max_retry_duration_secs: u64,
+}
+
+/// Default total retry time budget: 10 minutes.
+pub const DEFAULT_MAX_RETRY_DURATION_SECS: u64 = 600;
+
+/// Default overall request timeout in seconds. Covers the full request
+/// lifecycle for non-streaming (send + body read) and the response-header
+/// wait for streaming. The L2 per-chunk idle timeout
+/// ([`SamplerConfig::idle_timeout_secs`]) covers inter-chunk gaps
+/// separately. Default 300s (5 min), matching the default idle timeout.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+
+fn default_max_retry_duration_secs() -> u64 {
+    DEFAULT_MAX_RETRY_DURATION_SECS
+}
+
+/// Default for [`SamplerConfig::stream`]: streaming enabled.
+fn default_stream() -> bool {
+    true
 }
 
 impl Default for RetryPolicy {
@@ -207,6 +268,7 @@ impl Default for RetryPolicy {
             max_retries: DEFAULT_MAX_RETRIES,
             rate_limit_retry_threshold: RATE_LIMIT_RETRY_THRESHOLD,
             retry_only_before_output: false,
+            max_retry_duration_secs: DEFAULT_MAX_RETRY_DURATION_SECS,
         }
     }
 }
