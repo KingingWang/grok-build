@@ -457,6 +457,7 @@ impl ToolCallRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String,
@@ -469,11 +470,30 @@ pub struct ChatCompletionResponse {
     pub citations: Option<Vec<String>>,
 }
 
+impl Default for ChatCompletionResponse {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: String::new(),
+            choices: Vec::new(),
+            usage: None,
+            citations: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatChoice {
+    #[serde(default)]
     pub index: u32,
     pub message: ChatResponseMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::empty_string_as_none_value"
+    )]
     pub finish_reason: Option<FinishReason>,
 }
 
@@ -569,7 +589,8 @@ pub struct CompletionTokensDetails {
 }
 // ============ Streaming types ============
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct ChatCompletionChunk {
     pub id: String,
     pub object: String,
@@ -588,9 +609,14 @@ pub struct ChatCompletionChunk {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatChunkChoice {
+    #[serde(default)]
     pub index: u32,
     pub delta: ChatChunkDelta,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::empty_string_as_none_value"
+    )]
     pub finish_reason: Option<FinishReason>,
 }
 
@@ -1071,6 +1097,16 @@ pub struct SamplingConfig {
     /// API request body so the upstream emits per-chunk argument deltas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Whether to use a streaming HTTP request. `None` (unset) keeps the
+    /// default streaming behavior; `Some(false)` issues a single
+    /// non-streaming request. Mirrors [`SamplerConfig::stream`] and is
+    /// resolved with a `true` default when the sampler config is rebuilt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// Whether Responses API system messages should be sent through the
+    /// top-level `instructions` field instead of `input` system messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_system_prompt_as_instructions: Option<bool>,
 }
 
 // ============ Responses API wrapper ============
@@ -1484,6 +1520,40 @@ mod tests {
         assert_eq!(delta.role, Some(Role::Assistant));
         assert_eq!(delta.content, Some("".to_string()));
         assert!(delta.tool_calls.is_empty());
+    }
+
+    /// Regression test: some OpenAI-compatible providers emit
+    /// `"finish_reason": ""` (instead of `null`) on intermediate streaming
+    /// chunks and omit `model`. The empty string must be treated as `None`
+    /// rather than failing deserialization.
+    #[test]
+    fn test_chunk_empty_string_finish_reason_and_missing_model() {
+        let chunk_json = r#"{"id":"chunk-1","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"hi"},"finish_reason":""}],"created":1785828237,"object":"chat.completion.chunk"}"#;
+        let chunk = serde_json::from_str::<ChatCompletionChunk>(chunk_json)
+            .unwrap_or_else(|e| panic!("empty-string finish_reason must deserialize: {e}"));
+        assert_eq!(chunk.model, "");
+        assert_eq!(chunk.choices.len(), 1);
+        assert_eq!(chunk.choices[0].finish_reason, None);
+
+        let final_json = r#"{"id":"chunk-1","object":"chat.completion.chunk","created":1785828237,"model":"test-model","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#;
+        let final_chunk = serde_json::from_str::<ChatCompletionChunk>(final_json)
+            .expect("terminal finish_reason must still deserialize");
+        assert_eq!(final_chunk.model, "test-model");
+        assert_eq!(
+            final_chunk.choices[0].finish_reason,
+            Some(FinishReason::Stop)
+        );
+    }
+
+    /// Regression test: same tolerance for `"finish_reason": ""` in
+    /// non-streaming completions.
+    #[test]
+    fn test_chat_choice_empty_string_finish_reason() {
+        let json =
+            r#"{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":""}"#;
+        let choice = serde_json::from_str::<ChatChoice>(json)
+            .expect("empty-string finish_reason must deserialize");
+        assert_eq!(choice.finish_reason, None);
     }
 
     /// Regression test: cloning `Box<dyn TraceContext>` must not infinitely recurse.

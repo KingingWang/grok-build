@@ -108,6 +108,11 @@ impl ChatStateActor {
             prompt_cache_key: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
+            responses_system_prompt_as_instructions: self
+                .state
+                .sampling_config
+                .responses_system_prompt_as_instructions
+                .unwrap_or(false),
         }
     }
 }

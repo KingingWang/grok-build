@@ -1757,3 +1757,45 @@ fn serialized_body_contains_no_placeholder_strings() {
         "both reasoning siblings must be present"
     );
 }
+
+#[test]
+fn responses_system_prompt_can_use_top_level_instructions() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::system("System prompt"),
+        ConversationItem::user("User message"),
+    ]);
+    req.responses_system_prompt_as_instructions = true;
+
+    let responses_req: rs::CreateResponse = (&req).into();
+    assert_eq!(responses_req.instructions.as_deref(), Some("System prompt"));
+
+    let rs::InputParam::Items(items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+    assert_eq!(items.len(), 1);
+    assert!(matches!(
+        &items[0],
+        rs::InputItem::EasyMessage(message) if message.role == rs::Role::User
+    ));
+}
+
+#[test]
+fn responses_instructions_preserve_multiple_system_message_order() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::system("first"),
+        ConversationItem::system(""),
+        ConversationItem::system("second"),
+        ConversationItem::user("hello"),
+    ]);
+    req.responses_system_prompt_as_instructions = true;
+
+    let responses_req: rs::CreateResponse = (&req).into();
+    assert_eq!(
+        responses_req.instructions.as_deref(),
+        Some("first\n\nsecond")
+    );
+    let rs::InputParam::Items(items) = responses_req.input else {
+        panic!("Expected Items input");
+    };
+    assert_eq!(items.len(), 1);
+}
