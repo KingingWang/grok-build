@@ -97,6 +97,7 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
 impl From<&ConversationRequest> for rs::CreateResponse {
     fn from(req: &ConversationRequest) -> Self {
         let input = build_responses_input(req);
+        let instructions = build_responses_instructions(req);
         let tools = build_responses_tools(req);
 
         let tool_choice = req.tool_choice.as_ref().map(|tc| match tc {
@@ -130,7 +131,7 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             conversation: None,
             include: None,
             input,
-            instructions: None,
+            instructions,
             max_output_tokens: req.max_output_tokens,
             max_tool_calls: None,
             metadata: None,
@@ -169,9 +170,38 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
     let items: Vec<rs::InputItem> = req
         .items
         .iter()
+        .filter(|item| {
+            !(req.responses_system_prompt_as_instructions
+                && matches!(item, ConversationItem::System(_)))
+        })
         .flat_map(conversation_item_to_input_items)
         .collect();
     rs::InputParam::Items(items)
+}
+
+/// Collect system messages for Responses API endpoints that require the
+/// top-level `instructions` field. Multiple system messages retain their
+/// relative order and are separated by a blank line.
+fn build_responses_instructions(req: &ConversationRequest) -> Option<String> {
+    if !req.responses_system_prompt_as_instructions {
+        return None;
+    }
+
+    let mut instructions = String::new();
+    for item in &req.items {
+        let ConversationItem::System(system) = item else {
+            continue;
+        };
+        if system.content.is_empty() {
+            continue;
+        }
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(&system.content);
+    }
+
+    (!instructions.is_empty()).then_some(instructions)
 }
 
 /// Inject the `type: "reasoning_text"` discriminator the API requires.

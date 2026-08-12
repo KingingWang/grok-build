@@ -628,6 +628,10 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// When true, Responses API system messages are sent through the top-level
+    /// `instructions` field instead of `input` items with `role: "system"`.
+    /// This is required by some OpenAI-compatible third-party endpoints.
+    pub responses_system_prompt_as_instructions: bool,
 }
 
 impl ConversationRequest {
