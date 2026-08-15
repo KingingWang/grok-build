@@ -1,0 +1,157 @@
+name: Publish npm packages
+
+# Publishes the grok npm packages from the binaries of an existing GitHub
+# release (produced by release.yml). Manual dispatch only: pick the tag whose
+# assets should go out on npm.
+#
+# The packaging scripts and npm/ package dirs are taken from the dispatch
+# branch (like pi's npm-dist flow); only the binaries come from the release.
+# Prepare step stamps the release version over all seven package.json files
+# and retargets the @xai-official scope to GROK_NPM_SCOPE.
+#
+# release.yml currently builds macOS + Linux binaries only, so the win32
+# platform packages are skipped (GROK_PLATFORMS below). npm tolerates the
+# missing optionalDependencies on Windows with a warning; add Windows builds
+# to release.yml and extend the list to ship them.
+#
+# Required configuration:
+#   secrets.NPM_TOKEN     npm automation token with publish rights
+#   vars.GROK_NPM_SCOPE   npm scope to publish under (default: @kingingwang)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed release tag to publish
+        required: true
+        type: string
+      dry-run:
+        description: Assemble and pack without publishing to npm
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-npm-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GROK_PLATFORMS: darwin-arm64,darwin-x64,linux-x64,linux-arm64
+  # Full brotli parallelism in assemble (Node's default pool is 4).
+  UV_THREADPOOL_SIZE: 6
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Resolve version from tag
+        id: version
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          GROK_NPM_SCOPE: ${{ vars.GROK_NPM_SCOPE }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._]+)?$ ]]; then
+            echo "Tag '$TAG' is not a v-prefixed semver tag." >&2
+            exit 1
+          fi
+          version="${TAG#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          scope="${GROK_NPM_SCOPE:-@kingingwang}"
+          if npm view "${scope}/grok@${version}" version >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip publish (version already on npm)
+        if: ${{ steps.version.outputs.skip == 'true' }}
+        run: echo "${{ steps.version.outputs.version }} is already published; nothing to do."
+
+      - name: Download release assets
+        if: ${{ steps.version.outputs.skip != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --dir dist --clobber
+
+      - name: Verify asset checksums
+        if: ${{ steps.version.outputs.skip != 'true' }}
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+
+      - name: Stamp version and npm scope
+        if: ${{ steps.version.outputs.skip != 'true' }}
+        working-directory: crates/codegen/xai-grok-pager/npm/grok
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GROK_NPM_SCOPE: ${{ vars.GROK_NPM_SCOPE }}
+        run: node scripts/prepare-publish.js --version "$VERSION" --scope "${GROK_NPM_SCOPE:-@kingingwang}"
+
+      - name: Assemble platform packages (brotli binaries)
+        if: ${{ steps.version.outputs.skip != 'true' }}
+        working-directory: crates/codegen/xai-grok-pager/npm/grok
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GROK_DARWIN_ARM64: ${{ github.workspace }}/dist/grok-${{ steps.version.outputs.version }}-macos-aarch64
+          GROK_DARWIN_X64: ${{ github.workspace }}/dist/grok-${{ steps.version.outputs.version }}-macos-x86_64
+          GROK_LINUX_X64: ${{ github.workspace }}/dist/grok-${{ steps.version.outputs.version }}-linux-x86_64
+          GROK_LINUX_ARM64: ${{ github.workspace }}/dist/grok-${{ steps.version.outputs.version }}-linux-aarch64
+        run: node scripts/assemble-platform-packages.js
+
+      - name: Publish to npm
+        if: ${{ steps.version.outputs.skip != 'true' }}
+        working-directory: crates/codegen/xai-grok-pager/npm/grok
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          if [[ "$DRY_RUN" == "true" ]]; then
+            node scripts/publish-packages.js --dry-run
+          else
+            node scripts/publish-packages.js
+          fi
+
+      - name: Sync npmmirror cache
+        if: ${{ steps.version.outputs.skip != 'true' && !inputs.dry-run }}
+        shell: bash
+        env:
+          GROK_NPM_SCOPE: ${{ vars.GROK_NPM_SCOPE }}
+        run: |
+          set -euo pipefail
+          scope="${GROK_NPM_SCOPE:-@kingingwang}"
+          packages=(grok)
+          IFS=',' read -ra platforms <<< "$GROK_PLATFORMS"
+          for platform in "${platforms[@]}"; do
+            packages+=("grok-${platform}")
+          done
+          failed=0
+          for package in "${packages[@]}"; do
+            response="$(curl -sS -X PUT "https://registry.npmmirror.com/-/package/${scope}/${package}/syncs")"
+            echo "${scope}/${package}: ${response}"
+            if ! printf '%s' "$response" | grep -q '"ok":true'; then
+              failed=1
+            fi
+          done
+          if [[ "$failed" -ne 0 ]]; then
+            echo "::error::One or more npmmirror sync requests failed."
+            exit 1
+          fi
