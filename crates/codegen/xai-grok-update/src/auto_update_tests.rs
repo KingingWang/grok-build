@@ -989,7 +989,7 @@ fn test_reinstall_hint_npm_mentions_npm_command() {
     let hint = reinstall_hint("npm", "stable");
     assert!(hint.contains("npm i -g"), "should suggest npm i -g: {hint}");
     assert!(
-        hint.contains("@xai-official/grok"),
+        hint.contains("@kingingwang/grok"),
         "should name the package: {hint}"
     );
 }
@@ -1002,7 +1002,7 @@ fn test_reinstall_hint_gh_release_mentions_gh_command() {
         "should suggest gh release download: {hint}"
     );
     assert!(
-        hint.contains("xai-org-shared/grok-build"),
+        hint.contains("KingingWang/grok-build"),
         "should name the repo: {hint}"
     );
 }
