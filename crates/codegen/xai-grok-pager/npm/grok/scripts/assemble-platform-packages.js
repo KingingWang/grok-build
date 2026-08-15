@@ -35,6 +35,14 @@ const META_PKG_JSON = path.resolve(__dirname, '..', 'package.json');
 const meta = JSON.parse(fs.readFileSync(META_PKG_JSON, 'utf8'));
 const VERSION = meta.version;
 
+// Optional allowlist of "<platform>-<arch>" targets to assemble, e.g.
+// GROK_PLATFORMS="darwin-arm64,darwin-x64,linux-x64,linux-arm64" when the
+// release only ships a subset of the six upstream targets. Unset = all six.
+const ONLY = (process.env.GROK_PLATFORMS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
 function ensureDir(p) { fs.mkdirSync(path.dirname(p), { recursive: true }); }
 
 async function packPlatform({ platform, arch, envVar, defaultSource, binName }) {
@@ -118,17 +126,29 @@ async function main() {
         },
     ];
 
+    const selected = targets.filter(t =>
+        ONLY.length === 0 || ONLY.includes(`${t.platform}-${t.arch}`));
+    if (selected.length === 0) {
+        console.error(`[assemble] GROK_PLATFORMS matched no targets: ${ONLY.join(', ')}`);
+        process.exit(1);
+    }
+    const unknown = ONLY.filter(name => !targets.some(t => `${t.platform}-${t.arch}` === name));
+    if (unknown.length > 0) {
+        console.error(`[assemble] Unknown GROK_PLATFORMS entries: ${unknown.join(', ')}`);
+        process.exit(1);
+    }
+
     // Compress in parallel — brotliCompress runs on the libuv thread pool so
     // calls genuinely overlap (set UV_THREADPOOL_SIZE>=6 in CI for full
     // parallelism; Node's default pool size is 4).
-    const results = await Promise.all(targets.map(packPlatform));
+    const results = await Promise.all(selected.map(packPlatform));
     const failed = results.filter(r => !r).length;
     if (failed > 0) {
         console.error(`[assemble] ${failed} target(s) failed.`);
         process.exit(1);
     }
 
-    console.log(`[assemble] All 6 per-platform packages assembled at version ${VERSION}.`);
+    console.log(`[assemble] ${selected.length} per-platform package(s) assembled at version ${VERSION}.`);
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });
