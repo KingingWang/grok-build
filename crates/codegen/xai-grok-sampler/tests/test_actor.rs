@@ -76,7 +76,6 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         // Keep retries minimal so tests don't take forever.
         max_retries: Some(2),
         idle_timeout_secs: Some(30),
-        stream: false,
         ..Default::default()
     }
 }
@@ -1057,7 +1056,10 @@ async fn auth_401_emits_failed_immediately_no_retry() {
     );
     let server = MockServer::spawn(app).await;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let cfg = test_config(server.base_url(), "test-model");
+    let mut cfg = test_config(server.base_url(), "test-model");
+    // Immediate emit-to-session on 401 only applies when the session can
+    // refresh credentials; static-BYOK configs retry 401s in-loop instead.
+    cfg.auth_refresh_available = true;
     let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
 
     let rid = RequestId::from("req-auth");
@@ -1066,7 +1068,9 @@ async fn auth_401_emits_failed_immediately_no_retry() {
     let events = drain_until_terminal(&mut event_rx, Duration::from_secs(5)).await;
     server.shutdown();
 
-    // The session owns auth errors: `classify_error` returns `EmitToSession`, so the actor emits Failed immediately without retrying
+    // With refresh available, the first server 401 is emitted to the
+    // session immediately (refresh interception) without any in-loop
+    // retry.
     assert!(
         !events
             .iter()
