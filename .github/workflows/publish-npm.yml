@@ -1,8 +1,8 @@
 name: Publish npm packages
 
 # Publishes the grok npm packages from the binaries of an existing GitHub
-# release (produced by release.yml). Manual dispatch only: pick the tag whose
-# assets should go out on npm.
+# release (produced by release.yml). Releases are published automatically when
+# they become non-draft; manual dispatch remains available for recovery.
 #
 # The packaging scripts and npm/ package dirs are taken from the dispatch
 # branch (like pi's npm-dist flow); only the binaries come from the release.
@@ -19,6 +19,8 @@ name: Publish npm packages
 #   vars.GROK_NPM_SCOPE   npm scope to publish under (default: @kingingwang)
 
 on:
+  release:
+    types: [released]
   workflow_dispatch:
     inputs:
       tag:
@@ -32,7 +34,7 @@ on:
         default: false
 
 concurrency:
-  group: publish-npm-${{ inputs.tag }}
+  group: publish-npm-${{ github.event.release.tag_name || github.event.inputs.tag }}
   cancel-in-progress: false
 
 permissions:
@@ -60,7 +62,7 @@ jobs:
         id: version
         shell: bash
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
           GROK_NPM_SCOPE: ${{ vars.GROK_NPM_SCOPE }}
         run: |
           set -euo pipefail
@@ -87,7 +89,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
         run: |
           set -euo pipefail
           gh release download "$TAG" --dir dist --clobber
@@ -121,7 +123,7 @@ jobs:
         working-directory: crates/codegen/xai-grok-pager/npm/grok
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          DRY_RUN: ${{ inputs.dry-run }}
+          DRY_RUN: ${{ github.event.inputs.dry-run || 'false' }}
         run: |
           set -euo pipefail
           if [[ "$DRY_RUN" == "true" ]]; then
@@ -131,7 +133,7 @@ jobs:
           fi
 
       - name: Sync npmmirror cache
-        if: ${{ steps.version.outputs.skip != 'true' && !inputs.dry-run }}
+        if: ${{ steps.version.outputs.skip != 'true' && github.event.inputs.dry-run != 'true' }}
         shell: bash
         env:
           GROK_NPM_SCOPE: ${{ vars.GROK_NPM_SCOPE }}
