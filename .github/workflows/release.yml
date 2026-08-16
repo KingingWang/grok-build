@@ -191,6 +191,17 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  publish-npm:
+    name: Publish npm packages
+    needs:
+      - prepare
+      - build
+      - release
+    uses: ./.github/workflows/publish-npm.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+    secrets: inherit
+
   release:
     name: Publish GitHub Release
     needs:
