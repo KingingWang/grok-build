@@ -1,8 +1,8 @@
 name: Publish npm packages
 
 # Publishes the grok npm packages from the binaries of an existing GitHub
-# release (produced by release.yml). Releases are published automatically when
-# they become non-draft; manual dispatch remains available for recovery.
+# release (produced by release.yml). release.yml calls this workflow directly
+# after publishing the release; manual dispatch remains available for recovery.
 #
 # The packaging scripts and npm/ package dirs are taken from the dispatch
 # branch (like pi's npm-dist flow); only the binaries come from the release.
@@ -19,8 +19,17 @@ name: Publish npm packages
 #   vars.GROK_NPM_SCOPE   npm scope to publish under (default: @kingingwang)
 
 on:
-  release:
-    types: [released]
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing v-prefixed release tag to publish
+        required: true
+        type: string
+      dry-run:
+        description: Assemble and pack without publishing to npm
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       tag:
@@ -34,7 +43,7 @@ on:
         default: false
 
 concurrency:
-  group: publish-npm-${{ github.event.release.tag_name || github.event.inputs.tag }}
+  group: publish-npm-${{ inputs.tag }}
   cancel-in-progress: false
 
 permissions:
@@ -62,7 +71,7 @@ jobs:
         id: version
         shell: bash
         env:
-          TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          TAG: ${{ inputs.tag }}
           GROK_NPM_SCOPE: ${{ vars.GROK_NPM_SCOPE }}
         run: |
           set -euo pipefail
@@ -89,7 +98,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           gh release download "$TAG" --dir dist --clobber
@@ -123,7 +132,7 @@ jobs:
         working-directory: crates/codegen/xai-grok-pager/npm/grok
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          DRY_RUN: ${{ github.event.inputs.dry-run || 'false' }}
+          DRY_RUN: ${{ inputs.dry-run }}
         run: |
           set -euo pipefail
           if [[ "$DRY_RUN" == "true" ]]; then
@@ -133,7 +142,7 @@ jobs:
           fi
 
       - name: Sync npmmirror cache
-        if: ${{ steps.version.outputs.skip != 'true' && github.event.inputs.dry-run != 'true' }}
+        if: ${{ steps.version.outputs.skip != 'true' && inputs.dry-run != true }}
         shell: bash
         env:
           GROK_NPM_SCOPE: ${{ vars.GROK_NPM_SCOPE }}
