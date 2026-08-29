@@ -961,7 +961,7 @@ mod tests {
         }
     }
 
-    fn incomplete_event(reason: &str) -> rs::ResponseStreamEvent {
+    fn incomplete_event_with_reason(reason: &str) -> rs::ResponseStreamEvent {
         let mut response = build_response(rs_types::Status::Incomplete);
         response.incomplete_details = Some(rs_types::IncompleteDetails {
             reason: reason.into(),
@@ -975,7 +975,7 @@ mod tests {
     async fn stop_reason_for_incomplete(reason: &str) -> Option<StopReason> {
         let raw = stream::iter(vec![
             Ok(text_delta_event("cut")),
-            Ok(incomplete_event(reason)),
+            Ok(incomplete_event_with_reason(reason)),
         ])
         .boxed();
         let events = collect(stream_responses(
