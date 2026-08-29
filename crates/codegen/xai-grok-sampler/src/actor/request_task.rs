@@ -828,6 +828,9 @@ async fn run_one_attempt_non_stream(
                 doom_check,
                 failed_response,
                 output_observed,
+                // Non-streaming responses are complete-or-error payloads, so
+                // a Length stop surfaces as a failure.
+                xai_grok_sampling_types::LengthPolicy::Fail,
             )
             .await
         }
@@ -850,6 +853,9 @@ async fn run_one_attempt_non_stream(
                 doom_check,
                 FailedResponseCapture::default(),
                 output_observed,
+                // Non-streaming responses are complete-or-error payloads, so
+                // a Length stop surfaces as a failure.
+                xai_grok_sampling_types::LengthPolicy::Fail,
             )
             .await
         }
@@ -872,6 +878,9 @@ async fn run_one_attempt_non_stream(
                 doom_check,
                 FailedResponseCapture::default(),
                 output_observed,
+                // Non-streaming responses are complete-or-error payloads, so
+                // a Length stop surfaces as a failure.
+                xai_grok_sampling_types::LengthPolicy::Fail,
             )
             .await
         }
