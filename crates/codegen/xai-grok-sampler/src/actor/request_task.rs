@@ -260,7 +260,7 @@ pub(crate) async fn run_request_task(
                     &err,
                     &event_tx,
                     &request_id,
-                    &mut completion_tx,
+                    &mut completion,
                 ) {
                     return request_id;
                 }
@@ -345,7 +345,7 @@ pub(crate) async fn run_request_task(
                     &error,
                     &event_tx,
                     &request_id,
-                    &mut completion_tx,
+                    &mut completion,
                 ) {
                     return request_id;
                 }
@@ -378,7 +378,7 @@ pub(crate) async fn run_request_task(
                     &error,
                     &event_tx,
                     &request_id,
-                    &mut completion_tx,
+                    &mut completion,
                 ) {
                     return request_id;
                 }
@@ -439,8 +439,8 @@ async fn apply_retry_decision(
     // retry_count == 0) is emitted again, bounded by the session's
     // `AuthRetrySchedule`.
     if err.is_auth_error() && config.auth_refresh_available && *retry_count == 0 {
-        emit_failed(event_tx, request_id, err);
-        send_completion(completion_tx, Err(clone_error(err)));
+        let terminal_event_queued = emit_failed(event_tx, request_id, err);
+        send_completion(completion, Err(clone_error(err)), terminal_event_queued);
         return false;
     }
 
@@ -627,7 +627,7 @@ fn time_budget_exhausted(
     err: &SamplingError,
     event_tx: &mpsc::UnboundedSender<SamplingEvent>,
     request_id: &RequestId,
-    completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
+    completion: &mut CompletionState,
 ) -> bool {
     if retry_started_at.elapsed() < max_retry_duration {
         return false;
@@ -639,8 +639,8 @@ fn time_budget_exhausted(
         error = %err,
         "retry time budget exhausted; surfacing last error as fatal"
     );
-    emit_failed(event_tx, request_id, err);
-    send_completion(completion_tx, Err(clone_error(err)));
+    let terminal_event_queued = emit_failed(event_tx, request_id, err);
+    send_completion(completion, Err(clone_error(err)), terminal_event_queued);
     true
 }
 
