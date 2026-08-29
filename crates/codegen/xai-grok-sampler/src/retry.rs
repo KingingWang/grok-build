@@ -253,20 +253,26 @@ pub fn classify_error(
         if max_retries == 0 || next_attempt >= max_retries {
             return RetryDecision::Fatal(clone_error(err));
         }
+        // Honor the server's `Retry-After` verbatim when present;
+        // otherwise exponential backoff with jitter. The cap for clamped
+        // server hints lives in `retry_after_or_backoff` (session pacer);
+        // the in-loop path follows the retry policy above.
         let backoff = err
             .retry_after()
             .map(Duration::from_secs)
             .unwrap_or_else(|| retry_backoff_with_jitter(next_attempt));
         if next_attempt == 1 {
-            let backoff = match err {
+            // First transport-level failure: rebuild the client quickly
+            // (poisoned HTTP/2 pool) instead of waiting out the backoff.
+            let rebuild_backoff = match err {
                 SamplingError::Http(_) => jitter_backoff(TRANSPORT_REBUILD_BACKOFF),
-                _ => retry_after_or_backoff(next_attempt, err.retry_after()),
+                _ => backoff,
             };
-            return RetryDecision::RetryWithClientRebuild { backoff };
+            return RetryDecision::RetryWithClientRebuild {
+                backoff: rebuild_backoff,
+            };
         }
-        return RetryDecision::Retry {
-            backoff: retry_after_or_backoff(next_attempt, err.retry_after()),
-        };
+        return RetryDecision::Retry { backoff };
     }
 
     RetryDecision::Fatal(clone_error(err))
