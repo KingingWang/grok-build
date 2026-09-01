@@ -703,15 +703,19 @@ mod tests {
             } => assert!(is_rate_limited),
             other => panic!("expected RetryWithBackoff, got {other:?}"),
         }
-        // Without Retry-After the same message fast-fails: the request exceeds the per-minute cap outright and retrying is futile
+        // Fork policy: no size veto. Even without Retry-After the same
+        // message retries in-loop (jittered exponential backoff); only the
+        // count/time budget in the actor bounds the retry loop.
         let no_retry_after = api_err(
             StatusCode::TOO_MANY_REQUESTS,
             "Request too large for model: Limit 30000, Requested 50000 tokens per min",
         );
-        assert!(matches!(
-            classify_error(&no_retry_after, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
-            RetryDecision::Fatal(_)
-        ));
+        match classify_error(&no_retry_after, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
+            RetryDecision::RetryWithBackoff {
+                is_rate_limited, ..
+            } => assert!(is_rate_limited),
+            other => panic!("expected RetryWithBackoff, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1011,8 +1015,10 @@ mod tests {
     }
 
     #[test]
-    fn drifted_size_overflow_wordings_are_fatal_on_turn_path() {
-        // Size-worded errors with no code must fail fast, not burn the retry budget
+    fn drifted_size_overflow_wordings_retry_on_turn_path() {
+        // Fork policy: the retry veto is removed. Size-worded errors are
+        // retried like every other failure; the actor's count/time budget
+        // bounds the loop.
         let api_500 = SamplingError::Api {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "exceed_context_size_error: request (300000 tokens) exceeds the model \
@@ -1025,7 +1031,7 @@ mod tests {
         };
         assert!(matches!(
             classify_error(&api_500, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
-            RetryDecision::Fatal(_)
+            RetryDecision::RetryWithClientRebuild { .. } | RetryDecision::Retry { .. }
         ));
 
         let stream = SamplingError::StreamError {
@@ -1035,12 +1041,13 @@ mod tests {
                 .into(),
             code: None,
         };
-        assert!(matches!(
+        assert!(!matches!(
             classify_error(&stream, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
             RetryDecision::Fatal(_)
         ));
 
-        // Token-tier code with an opaque message: fatal, no strip.
+        // Token-tier code with an opaque message: retried under the fork
+        // policy, no image-strip shortcut.
         let coded = SamplingError::StreamError {
             error_type: "BAD_REQUEST".into(),
             message: "request rejected".into(),
@@ -1048,7 +1055,7 @@ mod tests {
                 "exceed_context_size_error",
             )),
         };
-        assert!(matches!(
+        assert!(!matches!(
             classify_error(&coded, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
             RetryDecision::Fatal(_)
         ));
