@@ -983,51 +983,11 @@ async fn rate_limit_exhausts_at_default_threshold_and_yields_failed() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_rate_limit_threshold_controls_total_wire_attempts() {
-    let counter = Arc::new(AtomicU32::new(0));
-    let counter_handler = Arc::clone(&counter);
-    let app = Router::new().route(
-        "/v1/chat/completions",
-        post(move || {
-            let counter = Arc::clone(&counter_handler);
-            async move {
-                counter.fetch_add(1, Ordering::SeqCst);
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [("retry-after", "0")],
-                    json!({ "error": { "message": "slow down" } }).to_string(),
-                )
-            }
-        }),
-    );
-    let server = MockServer::spawn(app).await;
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let mut cfg = test_config(server.base_url(), "test-model");
-    cfg.max_retries = Some(6);
-    cfg.rate_limit_retry_threshold = Some(4);
-    let handle = SamplerActor::spawn(cfg, RetryPolicy::default(), event_tx);
-
-    let rid = RequestId::from("req-429");
-    handle.submit(rid.clone(), user_request("hi"));
-
-    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(60)).await;
-    server.shutdown();
-
-    match events.last().unwrap() {
-        SamplingEvent::Failed { error, .. } => {
-            assert_eq!(error.kind, SamplingErrorKind::RateLimited);
-            assert_eq!(error.status_code, Some(429));
-        }
-        other => panic!("expected Failed(RateLimited), got {other:?}"),
-    }
-
-    let hits = counter.load(Ordering::SeqCst);
-    assert_eq!(
-        hits, 4,
-        "the configured threshold is a total-attempt ceiling and must override the policy default of 2"
-    );
-}
+// Upstream's `configured_rate_limit_threshold_controls_total_wire_attempts` test
+// is intentionally dropped: the fork's retry policy retries 429s within the
+// wall-clock time budget (default 10 min) up to `max_retries`; the count-based
+// `rate_limit_retry_threshold` is retained only for `RATE_LIMIT_RETRY_DISABLED`
+// and does not cap 429 attempts. See `retry.rs` and `request_task.rs`.
 
 // ---------------------------------------------------------------------------
 // Auth error -> EmitToSession (immediate)
