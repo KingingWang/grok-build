@@ -412,8 +412,8 @@ async fn apply_retry_decision(
     parent: &tracing::Span,
 ) -> bool {
     // Server 401 interception: when the session can reactively refresh
-    // credentials (`auth_refresh_available` — OAuth session refresh,
-    // auth_provider re-mint, or devbox), emit the first 401 of this
+    // credentials (`auth_refresh_available` — OAuth session refresh or
+    // auth_provider re-mint), emit the first 401 of this
     // request to the session so it can refresh once and resubmit. When
     // no refresh mechanism exists (static BYOK / api-key auth), fall
     // through to `classify_error`'s generic retry-with-backoff arm so
@@ -432,9 +432,6 @@ async fn apply_retry_decision(
         return false;
     }
 
-    let rate_limit_threshold = config
-        .rate_limit_retry_threshold
-        .unwrap_or(retry_policy.rate_limit_retry_threshold);
     let decision = classify_error(err, *retry_count, max_retries, rate_limit_threshold);
 
     // Connection-reset / broken-pipe on body upload often means nginx rejected an oversized payload before responding 413
