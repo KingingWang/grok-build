@@ -742,11 +742,12 @@ impl SessionActor {
         );
         let request_compression = crate::util::config::request_compression_for_url(&cfg.base_url);
         // Whether the session can reactively refresh on a 401 (OAuth session
-        // refresh, auth_provider re-mint, devbox). Computed before the
-        // literal moves `cfg.model`.
+        // refresh, auth_provider re-mint). Computed before the literal moves
+        // `cfg.model`. Upstream removed the devbox login module in the
+        // latest sync; its public-build stub always returned false, so
+        // dropping the devbox term preserves the existing behavior.
         let auth_refresh_available = use_bearer_resolver
-            || self.model_auth_provider(&cfg.model).is_some()
-            || crate::auth::devbox_login::is_devbox_environment();
+            || self.model_auth_provider(&cfg.model).is_some();
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
