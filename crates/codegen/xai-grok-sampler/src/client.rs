@@ -666,6 +666,8 @@ impl SamplingClient {
         }
 
         // Always set User-Agent: per-session origin if available, else fallback.
+        // Do not overwrite an explicit User-Agent installed earlier from
+        // `extra_headers` / `env_http_headers` — a configured UA wins.
         {
             let ua_string = match config.origin_client.as_ref() {
                 Some(origin) => user_agent_string_for(origin),
@@ -675,7 +677,7 @@ impl SamplingClient {
                 }),
             };
             if let Ok(v) = HeaderValue::from_str(&ua_string) {
-                headers.insert(USER_AGENT, v);
+                headers.entry(USER_AGENT).or_insert(v);
             }
         }
 
