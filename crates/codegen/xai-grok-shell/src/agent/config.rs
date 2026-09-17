@@ -3814,8 +3814,6 @@ pub struct ModelEntryConfig {
     /// `none` omits the field for BYOK gateways that reject it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<ReasoningSummary>,
-    /// Per-model Layer-3 LazinessDetector configuration.
-    /// Defaults to the all-disabled state via `#[serde(default)]`.
     /// Whether to use a streaming HTTP request for this model. When `false`,
     /// the sampler issues a single non-streaming request. Unset (the default)
     /// keeps streaming.
@@ -3871,6 +3869,9 @@ impl Default for ModelEntryConfig {
             show_model_fingerprint: false,
             stream_tool_calls: None,
             reasoning_summary: None,
+            user_agent: None,
+            stream: None,
+            responses_system_prompt_as_instructions: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -4053,6 +4054,7 @@ impl ConfigModelOverride {
         }
         if self.reasoning_summary.is_some() {
             entry.info.reasoning_summary = self.reasoning_summary;
+        }
         if self.stream.is_some() {
             entry.info.stream = self.stream;
         }
@@ -4157,9 +4159,6 @@ pub struct ModelInfo {
     /// Responses API `reasoning.summary` override; `None` keeps the request builder's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<ReasoningSummary>,
-    /// Per-model Layer-3 LazinessDetector configuration. Defaults to the all-disabled state.
-    /// The feature is per-model opt-in, with a second-step `max_nudges_per_session > 0` opt-in for actually injecting nudges.
-    /// See [`LazinessDetectorPerModelConfig`].
     /// Whether to use a streaming HTTP request for this model. `Some(true)`
     /// (the default when unset) uses the streaming API; `Some(false)` issues
     /// a single non-streaming request and surfaces the full response at once.
