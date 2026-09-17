@@ -3806,6 +3806,8 @@ mod tests {
         let mut request = CreateResponseWrapper::new(rs::CreateResponse::default());
         without.apply_response_defaults(&mut request).unwrap();
         assert_eq!(request.inner.reasoning, None);
+    }
+
     #[test]
     fn deserialize_response_event_ignores_response_metadata_extension() {
         let sse = r#"{
