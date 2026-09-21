@@ -9,7 +9,7 @@ use super::*;
 use agent_client_protocol as acp;
 
 use crate::session::SideQuestionError;
-use xai_grok_sampling_types::SamplingError;
+use xai_grok_sampling_types::{SamplingError, is_retryable_api_status};
 
 /// Max characters of a recap persisted to `summary.json` for session-list display.
 /// The full recap can be long and rides every row of the session-list response.
@@ -83,7 +83,16 @@ fn side_question_retry_policy() -> backon::ExponentialBuilder {
 /// Retry transient failures per the canonical [`SamplingError::is_retryable`] rule (5xx including Cloudflare 52x, stream and connect glitches).
 /// Excludes the shared vetoes (`x-should-retry: false`, context length) and rate limits; a 429 needs `Retry-After`-scale waits, not this budget.
 fn should_retry_side_question(e: &SamplingError) -> bool {
-    e.is_retryable() && !e.is_rate_limited() && !e.is_retry_vetoed()
+    // Fork note: `SamplingError::is_retryable` reports every HTTP status as
+    // retryable under the time-budget policy (the sampler's retry loop bounds
+    // the cost). Side questions keep the fine-grained per-status rule: the
+    // /btw retry budget is only ~3 sub-second attempts, so deterministic
+    // 4xx and origin-TLS 525/526 must still fail fast.
+    let retryable = match e {
+        SamplingError::Api { status, .. } => is_retryable_api_status(*status),
+        other => other.is_retryable(),
+    };
+    retryable && !e.is_rate_limited() && !e.is_retry_vetoed()
 }
 
 /// Clone the base `/btw` request and stamp a fresh `req_id`, so retried attempts never collide in logs.
