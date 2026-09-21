@@ -1321,12 +1321,16 @@ fn every_terminal_posts_one_delta_with_the_settled_outcome() {
                     "test",
                 )),
             );
-            // A 400 is terminal for the turn; a 5xx would be retried against an empty script queue.
+            // Fork note: under the fork's time-budget retry policy a plain
+            // 400 retries against an empty script queue, so make the
+            // terminal failure an image-processing 400 instead — with no
+            // images on the request, the image-strip recovery upgrades to
+            // fatal immediately.
             server.enqueue_response(
                 "/v1/responses",
                 ScriptedResponse::json(
                     400,
-                    serde_json::json!({ "error": { "message": "bad request", "type": "invalid_request_error" } }),
+                    serde_json::json!({ "error": { "message": "Could not process image: bad request", "type": "invalid_request_error" } }),
                 ),
             );
             let (addr, mut delta_rx) = turn_delta_sink().await;
